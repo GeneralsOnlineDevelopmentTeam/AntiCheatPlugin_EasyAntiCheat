@@ -61,7 +61,6 @@ typedef void (*ConnectionStateChangedCallbackFunc)(
 	int connectionState
 	);
 
-typedef void (*LoggingFunc)(const char*);
 LoggingFunc g_fnLoggingFunc = nullptr;
 LoggingFunc g_fnLobbyChatOutput = nullptr;
 
@@ -93,6 +92,20 @@ PLUGIN_API void SetLobbyChatOutputFunction(LoggingFunc cb);
 PLUGIN_API void SetACActionRequiredCallback(ACPlayerActionRequiredCallbackFunc cb);
 PLUGIN_API void SetACIntegrityViolationOccurredCallback(ACIntegrityViolationCallbackFunc cb);
 PLUGIN_API void SetSendMessageViaTransportCallback(SendMessageViaTransportFunc cb);
+
+// Callback de-registration. The host MUST call ClearAllHostCallbacks() (or the
+// individual Clear* functions) BEFORE destroying any object whose member
+// function is the target of one of the Set* callbacks. The plugin retains
+// these pointers and may invoke them from EOS/EAC worker threads at any time
+// while the platform is alive; failing to clear them produces a use-after-
+// free that manifests as an access violation or privileged-instruction fault
+// on a worker thread with EIP pointing at unmapped / recycled memory.
+PLUGIN_API void ClearLoggingFunction();
+PLUGIN_API void ClearLobbyChatOutputFunction();
+PLUGIN_API void ClearACActionRequiredCallback();
+PLUGIN_API void ClearACIntegrityViolationOccurredCallback();
+PLUGIN_API void ClearSendMessageViaTransportCallback();
+PLUGIN_API void ClearAllHostCallbacks();
 
 // Required plugin functions
 PLUGIN_API void ACMessageArrivedViaTransport(uint32_t sourceUserID, void* data, uint32_t dataLen);
@@ -126,6 +139,8 @@ ACIntegrityViolationCallbackFunc g_fnAnticheatIntegrityViolationOccurredCallback
 ACPlayerActionRequiredCallbackFunc g_fnAnticheatActionCallback = nullptr;
 SendMessageViaTransportFunc g_fnSendMessageViaTransport = nullptr;
 bool g_bEventsHooked = false;
+bool g_bSessionActive = false;
+bool g_bLoginInFlight = false;
 
 // ------------------------------------------------------------
 // Enums
