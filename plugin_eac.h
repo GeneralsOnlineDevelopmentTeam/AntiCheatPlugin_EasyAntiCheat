@@ -93,6 +93,7 @@ PLUGIN_API void SetLobbyChatOutputFunction(LoggingFunc cb);
 PLUGIN_API void SetACActionRequiredCallback(ACPlayerActionRequiredCallbackFunc cb);
 PLUGIN_API void SetACIntegrityViolationOccurredCallback(ACIntegrityViolationCallbackFunc cb);
 PLUGIN_API void SetSendMessageViaTransportCallback(SendMessageViaTransportFunc cb);
+PLUGIN_API void ClearHostCallbacks();
 
 // Required plugin functions
 PLUGIN_API void ACMessageArrivedViaTransport(uint32_t sourceUserID, void* data, uint32_t dataLen);
@@ -126,6 +127,10 @@ ACIntegrityViolationCallbackFunc g_fnAnticheatIntegrityViolationOccurredCallback
 ACPlayerActionRequiredCallbackFunc g_fnAnticheatActionCallback = nullptr;
 SendMessageViaTransportFunc g_fnSendMessageViaTransport = nullptr;
 bool g_bEventsHooked = false;
+bool g_bSessionActive = false;
+bool g_bLoginInFlight = false;
+bool g_bShuttingDown = false;
+uint64_t g_SessionGeneration = 0;
 
 // ------------------------------------------------------------
 // Enums
