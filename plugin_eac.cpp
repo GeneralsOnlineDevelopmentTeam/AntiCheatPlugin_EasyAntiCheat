@@ -9,6 +9,93 @@ EOS_NotificationId g_NotifyPeerActionRequiredId = 0;
 typedef void (*LoginCallback)(bool bSuccess);
 LoginCallback g_LoginCallback = nullptr;
 
+static DWORD GetCallbackThreadId()
+{
+	return GetCurrentThreadId();
+}
+
+static bool ShouldIgnoreCallback(uint64_t generation, const char* callbackName, uint32_t peerId = 0)
+{
+	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+	if (g_bShuttingDown || !g_bEventsHooked || generation != g_SessionGeneration || g_EOSPlatformHandle == nullptr)
+	{
+		PluginLog("[EAC] Ignoring stale callback %s thread=%lu generation=%llu current=%llu peer=%u shuttingDown=%d eventsHooked=%d",
+			callbackName ? callbackName : "(null)",
+			GetCallbackThreadId(),
+			(unsigned long long)generation,
+			(unsigned long long)g_SessionGeneration,
+			peerId,
+			g_bShuttingDown ? 1 : 0,
+			g_bEventsHooked ? 1 : 0);
+		return true;
+	}
+
+	return false;
+}
+
+static EOS_HAntiCheatClient GetAntiCheatHandleLocked()
+{
+	if (g_EOSPlatformHandle == nullptr)
+	{
+		return nullptr;
+	}
+
+	return EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+}
+
+static void ClearHostCallbacksLocked()
+{
+	g_fnLoggingFunc = nullptr;
+	g_fnLobbyChatOutput = nullptr;
+	g_fnAnticheatIntegrityViolationOccurredCallback = nullptr;
+	g_fnAnticheatActionCallback = nullptr;
+	g_fnSendMessageViaTransport = nullptr;
+	g_LoginCallback = nullptr;
+}
+
+static void UnhookEventsLocked(EOS_HAntiCheatClient acHandle)
+{
+	if (acHandle == nullptr)
+	{
+		g_NotifyClientIntegrityViolatedId = 0;
+		g_NotifyMessageToPeerId = 0;
+		g_NotifyPeerAuthStatusChangedId = 0;
+		g_NotifyPeerActionRequiredId = 0;
+		g_bEventsHooked = false;
+		return;
+	}
+
+	if (g_NotifyClientIntegrityViolatedId != 0)
+	{
+		EOS_AntiCheatClient_RemoveNotifyClientIntegrityViolated(acHandle, g_NotifyClientIntegrityViolatedId);
+		g_NotifyClientIntegrityViolatedId = 0;
+		PluginLog("[EAC] Removed ClientIntegrityViolated callback");
+	}
+
+	if (g_NotifyMessageToPeerId != 0)
+	{
+		EOS_AntiCheatClient_RemoveNotifyMessageToPeer(acHandle, g_NotifyMessageToPeerId);
+		g_NotifyMessageToPeerId = 0;
+		PluginLog("[EAC] Removed MessageToPeer callback");
+	}
+
+	if (g_NotifyPeerAuthStatusChangedId != 0)
+	{
+		EOS_AntiCheatClient_RemoveNotifyPeerAuthStatusChanged(acHandle, g_NotifyPeerAuthStatusChangedId);
+		g_NotifyPeerAuthStatusChangedId = 0;
+		PluginLog("[EAC] Removed PeerAuthStatusChanged callback");
+	}
+
+	if (g_NotifyPeerActionRequiredId != 0)
+	{
+		EOS_AntiCheatClient_RemoveNotifyPeerActionRequired(acHandle, g_NotifyPeerActionRequiredId);
+		g_NotifyPeerActionRequiredId = 0;
+		PluginLog("[EAC] Removed PeerActionRequired callback");
+	}
+
+	g_bEventsHooked = false;
+}
+
 BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD ul_reason_for_call, LPVOID /*lpReserved*/)
 {
 	switch (ul_reason_for_call)
@@ -20,18 +107,8 @@ BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD ul_reason_for_call, LPVOID /*lp
 
 		case DLL_PROCESS_DETACH:
 		{
-			// Clean up resources on DLL unload
-			std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-			if (g_EOSPlatformHandle != nullptr)
-			{
-				// Clear callback pointers to prevent use-after-free
-				g_fnLoggingFunc = nullptr;
-				g_fnLobbyChatOutput = nullptr;
-				g_fnAnticheatIntegrityViolationOccurredCallback = nullptr;
-				g_fnAnticheatActionCallback = nullptr;
-				g_fnSendMessageViaTransport = nullptr;
-				g_LoginCallback = nullptr;
-			}
+			// Do not call EOS/EAC cleanup here. Shutdown() owns cleanup outside
+			// the Windows loader lock.
 			break;
 		}
 	}
@@ -53,13 +130,15 @@ void PluginLog(const char* fmt, ...)
 	buffer[8192 - 1] = 0;
 	va_end(args);
 
-	// Lock before accessing global callback to prevent data race
+	LoggingFunc logger = nullptr;
 	{
 		std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-		if (g_fnLoggingFunc != nullptr)
-		{
-			g_fnLoggingFunc(buffer);
-		}
+		logger = g_fnLoggingFunc;
+	}
+
+	if (logger != nullptr)
+	{
+		logger(buffer);
 	}
 }
 
@@ -93,6 +172,12 @@ void SetSendMessageViaTransportCallback(SendMessageViaTransportFunc cb)
 	g_fnSendMessageViaTransport = cb;
 }
 
+void ClearHostCallbacks()
+{
+	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+	ClearHostCallbacksLocked();
+}
+
 void ACMessageArrivedViaTransport(uint32_t sourceUserID, void* data, uint32_t dataLen)
 {
 	if (data == nullptr || dataLen == 0)
@@ -103,13 +188,18 @@ void ACMessageArrivedViaTransport(uint32_t sourceUserID, void* data, uint32_t da
 
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	
-	if (g_EOSPlatformHandle == nullptr)
+	if (g_bShuttingDown || !g_bSessionActive || g_EOSPlatformHandle == nullptr)
 	{
-		PluginLog("[AC][EAC][REMOTE] ERROR: Platform handle is null");
+		PluginLog("[AC][EAC][REMOTE] Ignoring inbound message thread=%lu generation=%llu peer=%u shuttingDown=%d sessionActive=%d",
+			GetCallbackThreadId(),
+			(unsigned long long)g_SessionGeneration,
+			sourceUserID,
+			g_bShuttingDown ? 1 : 0,
+			g_bSessionActive ? 1 : 0);
 		return;
 	}
 
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandleLocked();
 	
 	if (acHandle == nullptr)
 	{
@@ -232,6 +322,12 @@ int Initialize()
         PluginLog("[EAC] Already initialized - skipping re-initialization");
         return 0;
     }
+
+	g_bShuttingDown = false;
+	g_bLoginInFlight = false;
+	g_bSessionActive = false;
+	g_bEventsHooked = false;
+	++g_SessionGeneration;
 
 	// Init EOS SDK
 	EOS_InitializeOptions SDKOptions = {};
@@ -407,34 +503,53 @@ int Initialize()
 PLUGIN_API void Shutdown()
 {
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+	g_bShuttingDown = true;
+	++g_SessionGeneration;
+
 	if (g_EOSPlatformHandle != nullptr)
 	{
+		EOS_HAntiCheatClient acHandle = GetAntiCheatHandleLocked();
+		UnhookEventsLocked(acHandle);
+
+		if (g_bSessionActive && acHandle != nullptr)
+		{
+			EOS_AntiCheatClient_EndSessionOptions endSessionOpts = {};
+			endSessionOpts.ApiVersion = EOS_ANTICHEATCLIENT_ENDSESSION_API_LATEST;
+			EOS_EResult result = EOS_AntiCheatClient_EndSession(acHandle, &endSessionOpts);
+			PluginLog("[EAC] Shutdown EndSession result=%s generation=%llu",
+				EOS_EResult_ToString(result),
+				(unsigned long long)g_SessionGeneration);
+		}
+
+		g_bSessionActive = false;
+		EOS_Logging_SetCallback(nullptr);
 		EOS_Platform_Release(g_EOSPlatformHandle);
 		g_EOSPlatformHandle = nullptr;
 	}
+	else
+	{
+		EOS_Logging_SetCallback(nullptr);
+	}
 
+	ClearHostCallbacksLocked();
 	EOS_Shutdown();
 	
 	// Reset global state
 	g_EOSUserID = nullptr;
 	g_goUserID = 0;
-	g_fnLoggingFunc = nullptr;
-	g_fnLobbyChatOutput = nullptr;
-	g_fnAnticheatIntegrityViolationOccurredCallback = nullptr;
-	g_fnAnticheatActionCallback = nullptr;
-	g_fnSendMessageViaTransport = nullptr;
-	g_LoginCallback = nullptr;
+	g_bLoginInFlight = false;
 	g_bEventsHooked = false;
+	g_bSessionActive = false;
 }
 
 bool IsExternalProcessRunning()
 {
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	if (g_EOSPlatformHandle == nullptr)
+	if (g_bShuttingDown || g_EOSPlatformHandle == nullptr)
 	{
 		return false;
 	}
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandleLocked();
 	return acHandle != nullptr;
 }
 
@@ -452,7 +567,7 @@ void HookupEvents()
 		return;
 	}
 
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandleLocked();
 	if (acHandle == nullptr)
 	{
 		PluginLog("[EAC] AC HANDLE NULL - Cannot hook events");
@@ -460,40 +575,34 @@ void HookupEvents()
 	}
 
 	// Clean up any existing notification IDs before registering new ones (prevents memory leak on re-hook)
-	if (g_NotifyClientIntegrityViolatedId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyClientIntegrityViolated(acHandle, g_NotifyClientIntegrityViolatedId);
-		g_NotifyClientIntegrityViolatedId = 0;
-	}
-	if (g_NotifyMessageToPeerId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyMessageToPeer(acHandle, g_NotifyMessageToPeerId);
-		g_NotifyMessageToPeerId = 0;
-	}
-	if (g_NotifyPeerAuthStatusChangedId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyPeerAuthStatusChanged(acHandle, g_NotifyPeerAuthStatusChangedId);
-		g_NotifyPeerAuthStatusChangedId = 0;
-	}
-	if (g_NotifyPeerActionRequiredId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyPeerActionRequired(acHandle, g_NotifyPeerActionRequiredId);
-		g_NotifyPeerActionRequiredId = 0;
-	}
+	UnhookEventsLocked(acHandle);
 
 	g_bEventsHooked = true;
+	const uint64_t generation = g_SessionGeneration;
+	void* callbackGeneration = reinterpret_cast<void*>(static_cast<uintptr_t>(generation));
 
 	EOS_AntiCheatClient_AddNotifyClientIntegrityViolatedOptions opts = {};
 	opts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYCLIENTINTEGRITYVIOLATED_API_LATEST;
-	g_NotifyClientIntegrityViolatedId = EOS_AntiCheatClient_AddNotifyClientIntegrityViolated(acHandle, &opts, nullptr, [](const EOS_AntiCheatClient_OnClientIntegrityViolatedCallbackInfo* Data)
+	g_NotifyClientIntegrityViolatedId = EOS_AntiCheatClient_AddNotifyClientIntegrityViolated(acHandle, &opts, callbackGeneration, [](const EOS_AntiCheatClient_OnClientIntegrityViolatedCallbackInfo* Data)
 		{
 			if (Data == nullptr)
 			{
 				return;
 			}
 
+			uint64_t generation = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Data->ClientData));
+			if (ShouldIgnoreCallback(generation, "ClientIntegrityViolated"))
+			{
+				return;
+			}
+
 			const char* violationMsg = Data->ViolationMessage ? Data->ViolationMessage : "(null)";
-			PluginLog("[EAC] AC VIOLATION: %s (%d)", violationMsg, Data->ViolationType);
+			PluginLog("[EAC] AC VIOLATION thread=%lu generation=%llu shuttingDown=%d: %s (%d)",
+				GetCallbackThreadId(),
+				(unsigned long long)generation,
+				g_bShuttingDown ? 1 : 0,
+				violationMsg,
+				Data->ViolationType);
 
 			ACIntegrityViolationCallbackFunc callback = nullptr;
 			{
@@ -510,7 +619,7 @@ void HookupEvents()
 
 	EOS_AntiCheatClient_AddNotifyMessageToPeerOptions AddNotifyMessageToPeerOpts = {};
 	AddNotifyMessageToPeerOpts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYMESSAGETOPEER_API_LATEST;
-	g_NotifyMessageToPeerId = EOS_AntiCheatClient_AddNotifyMessageToPeer(acHandle, &AddNotifyMessageToPeerOpts, nullptr, [](const EOS_AntiCheatCommon_OnMessageToClientCallbackInfo* Data)
+	g_NotifyMessageToPeerId = EOS_AntiCheatClient_AddNotifyMessageToPeer(acHandle, &AddNotifyMessageToPeerOpts, callbackGeneration, [](const EOS_AntiCheatCommon_OnMessageToClientCallbackInfo* Data)
 		{
 			if (Data == nullptr)
 			{
@@ -518,6 +627,12 @@ void HookupEvents()
 			}
 
 			uint32_t targetUserID = (uint32_t)Data->ClientHandle;
+			uint64_t generation = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Data->ClientData));
+			if (ShouldIgnoreCallback(generation, "MessageToPeer", targetUserID))
+			{
+				return;
+			}
+
 			EOS_HPlatform platformHandle = nullptr;
 			EOS_HAntiCheatClient acHandle = nullptr;
 			SendMessageViaTransportFunc sendMessageCallback = nullptr;
@@ -531,7 +646,7 @@ void HookupEvents()
 				}
 
 				platformHandle = g_EOSPlatformHandle;
-				acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+				acHandle = GetAntiCheatHandleLocked();
 				
 				if (acHandle == nullptr)
 				{
@@ -563,12 +678,20 @@ void HookupEvents()
 				}
 				else
 				{
-					PluginLog("[EAC][LOCAL] AC SEND MESSAGE TO PEER: %u bytes (User %u)", Data->MessageDataSizeBytes, (uint32_t)Data->ClientHandle);
+					PluginLog("[EAC][LOCAL] AC SEND MESSAGE TO PEER thread=%lu generation=%llu: %u bytes (User %u)",
+						GetCallbackThreadId(),
+						(unsigned long long)generation,
+						Data->MessageDataSizeBytes,
+						(uint32_t)Data->ClientHandle);
 				}
 			}
 			else // send via transport
 			{
-				PluginLog("[EAC][REMOTE] AC SEND MESSAGE TO PEER: %u bytes (User %u)", Data->MessageDataSizeBytes, targetUserID);
+				PluginLog("[EAC][REMOTE] AC SEND MESSAGE TO PEER thread=%lu generation=%llu: %u bytes (User %u)",
+					GetCallbackThreadId(),
+					(unsigned long long)generation,
+					Data->MessageDataSizeBytes,
+					targetUserID);
 				if (sendMessageCallback != nullptr)
 				{
 					sendMessageCallback(targetUserID, Data->MessageData, Data->MessageDataSizeBytes);
@@ -582,7 +705,7 @@ void HookupEvents()
 
 	EOS_AntiCheatClient_AddNotifyPeerAuthStatusChangedOptions authChangedOpts = {};
 	authChangedOpts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYPEERAUTHSTATUSCHANGED_API_LATEST;
-	g_NotifyPeerAuthStatusChangedId = EOS_AntiCheatClient_AddNotifyPeerAuthStatusChanged(acHandle, &authChangedOpts, nullptr, [](const EOS_AntiCheatCommon_OnClientAuthStatusChangedCallbackInfo* Data)
+	g_NotifyPeerAuthStatusChangedId = EOS_AntiCheatClient_AddNotifyPeerAuthStatusChanged(acHandle, &authChangedOpts, callbackGeneration, [](const EOS_AntiCheatCommon_OnClientAuthStatusChangedCallbackInfo* Data)
 		{
 			if (Data == nullptr)
 			{
@@ -590,20 +713,45 @@ void HookupEvents()
 			}
 
 			uint32_t userID = (uint32_t)Data->ClientHandle;
-			PluginLog("[EAC] AC PEER AUTH STATUS CHANGED: %d (User %u)", Data->ClientAuthStatus, userID);
+			uint64_t generation = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Data->ClientData));
+			if (ShouldIgnoreCallback(generation, "PeerAuthStatusChanged", userID))
+			{
+				return;
+			}
+
+			PluginLog("[EAC] AC PEER AUTH STATUS CHANGED thread=%lu generation=%llu shuttingDown=%d: %d (User %u)",
+				GetCallbackThreadId(),
+				(unsigned long long)generation,
+				g_bShuttingDown ? 1 : 0,
+				Data->ClientAuthStatus,
+				userID);
 		});
 
 	EOS_AntiCheatClient_AddNotifyPeerActionRequiredOptions actionRequiredOpts = {};
 	actionRequiredOpts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYPEERACTIONREQUIRED_API_LATEST;
-	g_NotifyPeerActionRequiredId = EOS_AntiCheatClient_AddNotifyPeerActionRequired(acHandle, &actionRequiredOpts, nullptr, [](const EOS_AntiCheatCommon_OnClientActionRequiredCallbackInfo* Data)
+	g_NotifyPeerActionRequiredId = EOS_AntiCheatClient_AddNotifyPeerActionRequired(acHandle, &actionRequiredOpts, callbackGeneration, [](const EOS_AntiCheatCommon_OnClientActionRequiredCallbackInfo* Data)
 		{
 			if (Data == nullptr)
 			{
 				return;
 			}
 
+			uint32_t userID = (uint32_t)Data->ClientHandle;
+			uint64_t generation = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Data->ClientData));
+			if (ShouldIgnoreCallback(generation, "PeerActionRequired", userID))
+			{
+				return;
+			}
+
 			const char* reasonStr = Data->ActionReasonDetailsString ? Data->ActionReasonDetailsString : "(null)";
-			PluginLog("[EAC] AC PEER ACTION REQIRED: %s (%d - %d)", reasonStr, Data->ClientAction, Data->ActionReasonCode);
+			PluginLog("[EAC] AC PEER ACTION REQUIRED thread=%lu generation=%llu peer=%u shuttingDown=%d: %s (%d - %d)",
+				GetCallbackThreadId(),
+				(unsigned long long)generation,
+				userID,
+				g_bShuttingDown ? 1 : 0,
+				reasonStr,
+				Data->ClientAction,
+				Data->ActionReasonCode);
 
 			EOS_HPlatform platformHandle = nullptr;
 			ACPlayerActionRequiredCallbackFunc callback = nullptr;
@@ -622,14 +770,13 @@ void HookupEvents()
 			
 			if (callback != nullptr)
 			{
-				uint32_t userID = (uint32_t)Data->ClientHandle;
 				if (Data->ClientHandle == EOS_ANTICHEATCLIENT_PEER_SELF)
 				{
-					PluginLog("[EAC] AC PEER ACTION REQIRED: is self (%u)", userID);
+					PluginLog("[EAC] AC PEER ACTION REQUIRED: is self (%u)", userID);
 				}
 				else
 				{
-					PluginLog("[EAC] AC PEER ACTION REQIRED: is remote (%u)", userID);
+					PluginLog("[EAC] AC PEER ACTION REQUIRED: is remote (%u)", userID);
 				}
 				callback(userID, Data->ActionReasonDetailsString, (int)(EAnticheatActionType)Data->ClientAction, (int)(EAnticheatActionReason)Data->ActionReasonCode);
 			}
@@ -638,9 +785,34 @@ void HookupEvents()
 
 void BeginSession()
 {
-	PluginLog("[EAC] BEGIN SESSION");
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	PluginLog("[EAC] BeginSession requested thread=%lu generation=%llu active=%d loginInFlight=%d shuttingDown=%d",
+		GetCallbackThreadId(),
+		(unsigned long long)g_SessionGeneration,
+		g_bSessionActive ? 1 : 0,
+		g_bLoginInFlight ? 1 : 0,
+		g_bShuttingDown ? 1 : 0);
+
+	if (g_bShuttingDown)
+	{
+		PluginLog("[EAC] BeginSession ignored during shutdown");
+		return;
+	}
+
+	if (g_bSessionActive)
+	{
+		PluginLog("[EAC] BeginSession ignored; session already active generation=%llu",
+			(unsigned long long)g_SessionGeneration);
+		return;
+	}
+
+	if (g_EOSUserID == nullptr)
+	{
+		PluginLog("[EAC] BeginSession ignored; local EOS user is null");
+		return;
+	}
+
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandleLocked();
 
 	if (acHandle == nullptr)
 	{
@@ -648,6 +820,7 @@ void BeginSession()
 		return;
 	}
 
+	++g_SessionGeneration;
 	HookupEvents();
 
 	EOS_AntiCheatClient_BeginSessionOptions beginSessionOpts = {};
@@ -658,10 +831,13 @@ void BeginSession()
 	if (result != EOS_EResult::EOS_Success)
 	{
 		PluginLog("[EAC] MIDDLEWARE ERROR, BEGIN SESSION: %s!", EOS_EResult_ToString(result));
+		UnhookEventsLocked(acHandle);
 	}
 	else
 	{
-		PluginLog("[EAC] BEGIN SESSION SUCCEEDED");
+		g_bSessionActive = true;
+		PluginLog("[EAC] BeginSession succeeded generation=%llu",
+			(unsigned long long)g_SessionGeneration);
 	}
 }
 
@@ -674,7 +850,18 @@ bool DeregisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 	}
 
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	if (g_bShuttingDown || !g_bSessionActive)
+	{
+		PluginLog("[EAC] DeregisterPlayer ignored for %s/%u generation=%llu shuttingDown=%d sessionActive=%d",
+			szMiddlewareUserID,
+			goUserID,
+			(unsigned long long)g_SessionGeneration,
+			g_bShuttingDown ? 1 : 0,
+			g_bSessionActive ? 1 : 0);
+		return true;
+	}
+
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandleLocked();
 
 	if (acHandle == nullptr)
 	{
@@ -707,7 +894,18 @@ bool RegisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 	}
 
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	if (g_bShuttingDown || !g_bSessionActive)
+	{
+		PluginLog("[EAC] RegisterPlayer ignored for %s/%u generation=%llu shuttingDown=%d sessionActive=%d",
+			szMiddlewareUserID,
+			goUserID,
+			(unsigned long long)g_SessionGeneration,
+			g_bShuttingDown ? 1 : 0,
+			g_bSessionActive ? 1 : 0);
+		return false;
+	}
+
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandleLocked();
 
 	if (acHandle == nullptr)
 	{
@@ -754,48 +952,41 @@ bool RegisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 void EndSession()
 {
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	PluginLog("[EAC] EndSession requested thread=%lu generation=%llu active=%d eventsHooked=%d shuttingDown=%d",
+		GetCallbackThreadId(),
+		(unsigned long long)g_SessionGeneration,
+		g_bSessionActive ? 1 : 0,
+		g_bEventsHooked ? 1 : 0,
+		g_bShuttingDown ? 1 : 0);
+
+	if (!g_bSessionActive)
+	{
+		++g_SessionGeneration;
+		EOS_HAntiCheatClient staleAcHandle = GetAntiCheatHandleLocked();
+		UnhookEventsLocked(staleAcHandle);
+		PluginLog("[EAC] EndSession ignored; no active session generation=%llu",
+			(unsigned long long)g_SessionGeneration);
+		return;
+	}
+
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandleLocked();
 
 	if (acHandle == nullptr)
 	{
 		PluginLog("[EAC] AC HANDLE NULL 1");
+		g_bSessionActive = false;
+		++g_SessionGeneration;
 		return;
 	}
 
-	g_bEventsHooked = false;
-
 	// Remove all registered notification callbacks before ending the session
-	if (g_NotifyClientIntegrityViolatedId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyClientIntegrityViolated(acHandle, g_NotifyClientIntegrityViolatedId);
-		g_NotifyClientIntegrityViolatedId = 0;
-		PluginLog("[EAC] Removed ClientIntegrityViolated callback");
-	}
-
-	if (g_NotifyMessageToPeerId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyMessageToPeer(acHandle, g_NotifyMessageToPeerId);
-		g_NotifyMessageToPeerId = 0;
-		PluginLog("[EAC] Removed MessageToPeer callback");
-	}
-
-	if (g_NotifyPeerAuthStatusChangedId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyPeerAuthStatusChanged(acHandle, g_NotifyPeerAuthStatusChangedId);
-		g_NotifyPeerAuthStatusChangedId = 0;
-		PluginLog("[EAC] Removed PeerAuthStatusChanged callback");
-	}
-
-	if (g_NotifyPeerActionRequiredId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyPeerActionRequired(acHandle, g_NotifyPeerActionRequiredId);
-		g_NotifyPeerActionRequiredId = 0;
-		PluginLog("[EAC] Removed PeerActionRequired callback");
-	}
+	++g_SessionGeneration;
+	UnhookEventsLocked(acHandle);
 
 	EOS_AntiCheatClient_EndSessionOptions endSessionOpts = {};
 	endSessionOpts.ApiVersion = EOS_ANTICHEATCLIENT_ENDSESSION_API_LATEST;
 	EOS_EResult result = EOS_AntiCheatClient_EndSession(acHandle, &endSessionOpts);
+	g_bSessionActive = false;
 	if (result != EOS_EResult::EOS_Success)
 	{
 		PluginLog("[EAC] MIDDLEWARE ERROR, END SESSION: %s!", EOS_EResult_ToString(result));
@@ -822,6 +1013,18 @@ void RefreshToken(const char* szGameToken, LoginCallback cb)
 	// refresh shouldnt need to create accounts etc, so should be fine to do less things
 	{
 		std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+		if (g_bShuttingDown)
+		{
+			PluginLog("[EAC] RefreshToken ignored during shutdown");
+			if (cb != nullptr)
+			{
+				cb(false);
+			}
+			return;
+		}
+
+		++g_SessionGeneration;
+		g_bLoginInFlight = true;
 		g_LoginCallback = cb;
 	}
 
@@ -835,6 +1038,7 @@ void RefreshToken(const char* szGameToken, LoginCallback cb)
 	}
 
 	EOS_HPlatform platformHandle = nullptr;
+	uint64_t loginGeneration = 0;
 	
 	{
 		std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
@@ -842,6 +1046,8 @@ void RefreshToken(const char* szGameToken, LoginCallback cb)
 		if (g_EOSPlatformHandle == nullptr)
 		{
 			PluginLog("[EAC] MIDDLEWARE ERROR: Platform not initialized!");
+			g_bLoginInFlight = false;
+			g_LoginCallback = nullptr;
 			if (cb != nullptr)
 			{
 				cb(false);
@@ -850,6 +1056,7 @@ void RefreshToken(const char* szGameToken, LoginCallback cb)
 		}
 		
 		platformHandle = g_EOSPlatformHandle;
+		loginGeneration = g_SessionGeneration;
 	}
 	// Lock released before async operation
 
@@ -858,6 +1065,11 @@ void RefreshToken(const char* szGameToken, LoginCallback cb)
 	if (ConnectHandle == nullptr)
 	{
 		PluginLog("[EAC] MIDDLEWARE ERROR: Connect handle is null!");
+		{
+			std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+			g_bLoginInFlight = false;
+			g_LoginCallback = nullptr;
+		}
 		if (cb != nullptr)
 		{
 			cb(false);
@@ -881,11 +1093,26 @@ void RefreshToken(const char* szGameToken, LoginCallback cb)
 	Options.UserLoginInfo = &userLoginInfo;
 
 	// TODO: Start a timeout
-	EOS_Connect_Login(ConnectHandle, &Options, nullptr, [](const EOS_Connect_LoginCallbackInfo* Data)
+	EOS_Connect_Login(ConnectHandle, &Options, reinterpret_cast<void*>(static_cast<uintptr_t>(loginGeneration)), [](const EOS_Connect_LoginCallbackInfo* Data)
 		{
 			if (Data == nullptr)
 			{
 				return;
+			}
+
+			uint64_t generation = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Data->ClientData));
+			{
+				std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+				if (g_bShuttingDown || generation != g_SessionGeneration)
+				{
+					PluginLog("[EAC] Ignoring stale RefreshToken callback thread=%lu generation=%llu current=%llu shuttingDown=%d",
+						GetCallbackThreadId(),
+						(unsigned long long)generation,
+						(unsigned long long)g_SessionGeneration,
+						g_bShuttingDown ? 1 : 0);
+					return;
+				}
+				g_bLoginInFlight = false;
 			}
 
 			// TODO: Clear timeout
@@ -940,7 +1167,31 @@ void RefreshToken(const char* szGameToken, LoginCallback cb)
 void Login(const char* szGameToken, LoginCallback cb)
 {
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+	if (g_bShuttingDown)
+	{
+		PluginLog("[EAC] Login ignored during shutdown");
+		if (cb != nullptr)
+		{
+			cb(false);
+		}
+		return;
+	}
+
+	if (g_bLoginInFlight)
+	{
+		PluginLog("[EAC] Login ignored; login already in flight generation=%llu",
+			(unsigned long long)g_SessionGeneration);
+		if (cb != nullptr)
+		{
+			cb(false);
+		}
+		return;
+	}
+
+	++g_SessionGeneration;
+	g_bLoginInFlight = true;
 	g_LoginCallback = cb;
+	uint64_t loginGeneration = g_SessionGeneration;
 
 	// Validate token pointer before logging to prevent format string vulnerabilities
 	if (szGameToken != nullptr)
@@ -957,6 +1208,8 @@ void Login(const char* szGameToken, LoginCallback cb)
 	if (g_EOSPlatformHandle == nullptr)
 	{
 		PluginLog("[EAC] MIDDLEWARE ERROR: Platform not initialized!");
+		g_bLoginInFlight = false;
+		g_LoginCallback = nullptr;
 		if (cb != nullptr)
 		{
 			cb(false);
@@ -969,6 +1222,8 @@ void Login(const char* szGameToken, LoginCallback cb)
 	if (ConnectHandle == nullptr)
 	{
 		PluginLog("[EAC] MIDDLEWARE ERROR: Connect handle is null!");
+		g_bLoginInFlight = false;
+		g_LoginCallback = nullptr;
 		if (cb != nullptr)
 		{
 			cb(false);
@@ -992,12 +1247,26 @@ void Login(const char* szGameToken, LoginCallback cb)
 	Options.UserLoginInfo = &userLoginInfo;
 	PluginLog("[EAC] D");
 	// TODO: Start a timeout
-	EOS_Connect_Login(ConnectHandle, &Options, nullptr, [](const EOS_Connect_LoginCallbackInfo* Data)
+	EOS_Connect_Login(ConnectHandle, &Options, reinterpret_cast<void*>(static_cast<uintptr_t>(loginGeneration)), [](const EOS_Connect_LoginCallbackInfo* Data)
 		{
 			PluginLog("[EAC] done");
 			if (Data == nullptr)
 			{
 				return;
+			}
+
+			uint64_t generation = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Data->ClientData));
+			{
+				std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+				if (g_bShuttingDown || generation != g_SessionGeneration)
+				{
+					PluginLog("[EAC] Ignoring stale Login callback thread=%lu generation=%llu current=%llu shuttingDown=%d",
+						GetCallbackThreadId(),
+						(unsigned long long)generation,
+						(unsigned long long)g_SessionGeneration,
+						g_bShuttingDown ? 1 : 0);
+					return;
+				}
 			}
 
 			PluginLog("[EAC] done2");
@@ -1026,6 +1295,7 @@ void Login(const char* szGameToken, LoginCallback cb)
 					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 					localCallback = g_LoginCallback;
 					g_LoginCallback = nullptr;
+					g_bLoginInFlight = false;
 				}
 				// Lock released before calling callback
 			
@@ -1047,9 +1317,12 @@ void Login(const char* szGameToken, LoginCallback cb)
 					if (g_EOSPlatformHandle == nullptr)
 					{
 						PluginLog("[EAC] ERROR: Platform handle is null in login callback!");
-						if (g_LoginCallback != nullptr)
+						LoginCallback localCallback = g_LoginCallback;
+						g_LoginCallback = nullptr;
+						g_bLoginInFlight = false;
+						if (localCallback != nullptr)
 						{
-							g_LoginCallback(false);
+							localCallback(false);
 						}
 						return;
 					}
@@ -1058,9 +1331,12 @@ void Login(const char* szGameToken, LoginCallback cb)
 					if (ConnectHandle == nullptr)
 					{
 						PluginLog("[EAC] ERROR: Connect handle is null!");
-						if (g_LoginCallback != nullptr)
+						LoginCallback localCallback = g_LoginCallback;
+						g_LoginCallback = nullptr;
+						g_bLoginInFlight = false;
+						if (localCallback != nullptr)
 						{
-							g_LoginCallback(false);
+							localCallback(false);
 						}
 						return;
 					}
@@ -1077,12 +1353,26 @@ void Login(const char* szGameToken, LoginCallback cb)
 				Options.ContinuanceToken = ContinuanceToken;
 
 				// NOTE: We're not deleting the received context because we're passing it down to another SDK call
-				EOS_Connect_CreateUser(ConnectHandle, &Options, nullptr,
+				EOS_Connect_CreateUser(ConnectHandle, &Options, reinterpret_cast<void*>(static_cast<uintptr_t>(generation)),
 					[](const EOS_Connect_CreateUserCallbackInfo* Data)
 					{
 						if (Data == nullptr)
 						{
 							return;
+						}
+
+						uint64_t generation = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Data->ClientData));
+						{
+							std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+							if (g_bShuttingDown || generation != g_SessionGeneration)
+							{
+								PluginLog("[EAC] Ignoring stale CreateUser callback thread=%lu generation=%llu current=%llu shuttingDown=%d",
+									GetCallbackThreadId(),
+									(unsigned long long)generation,
+									(unsigned long long)g_SessionGeneration,
+									g_bShuttingDown ? 1 : 0);
+								return;
+							}
 						}
 
 						if (Data->ResultCode == EOS_EResult::EOS_Success)
@@ -1106,6 +1396,7 @@ void Login(const char* szGameToken, LoginCallback cb)
 							std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 							localCallback = g_LoginCallback;
 							g_LoginCallback = nullptr;
+							g_bLoginInFlight = false;
 						}
 						// Lock released before calling callback
 					
@@ -1126,6 +1417,7 @@ void Login(const char* szGameToken, LoginCallback cb)
 					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 					localCallback = g_LoginCallback;
 					g_LoginCallback = nullptr;
+					g_bLoginInFlight = false;
 				}
 				// Lock released before calling callback
 			
