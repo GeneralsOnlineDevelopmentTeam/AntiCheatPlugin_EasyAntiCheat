@@ -1,5 +1,21 @@
 #include "plugin_eac.h"
 
+// ------------------------------------------------------------
+// Global definitions (declared extern in plugin_eac.h)
+// ------------------------------------------------------------
+LoggingFunc g_fnLoggingFunc = nullptr;
+LoggingFunc g_fnLobbyChatOutput = nullptr;
+EOS_HPlatform g_EOSPlatformHandle = nullptr;
+std::recursive_mutex g_StateMutex;
+
+EOS_ProductUserId g_EOSUserID = nullptr;
+uint32_t g_goUserID = 0;
+
+ACIntegrityViolationCallbackFunc g_fnAnticheatIntegrityViolationOccurredCallback = nullptr;
+ACPlayerActionRequiredCallbackFunc g_fnAnticheatActionCallback = nullptr;
+SendMessageViaTransportFunc g_fnSendMessageViaTransport = nullptr;
+bool g_bEventsHooked = false;
+
 // Global notification IDs for callback cleanup
 EOS_NotificationId g_NotifyClientIntegrityViolatedId = 0;
 EOS_NotificationId g_NotifyMessageToPeerId = 0;
@@ -8,6 +24,9 @@ EOS_NotificationId g_NotifyPeerActionRequiredId = 0;
 
 typedef void (*LoginCallback)(bool bSuccess);
 LoginCallback g_LoginCallback = nullptr;
+
+// Forward declaration so DllMain can call Shutdown() defined later in this file.
+PLUGIN_API void Shutdown();
 
 BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD ul_reason_for_call, LPVOID /*lpReserved*/)
 {
@@ -20,18 +39,11 @@ BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD ul_reason_for_call, LPVOID /*lp
 
 		case DLL_PROCESS_DETACH:
 		{
-			// Clean up resources on DLL unload
-			std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-			if (g_EOSPlatformHandle != nullptr)
-			{
-				// Clear callback pointers to prevent use-after-free
-				g_fnLoggingFunc = nullptr;
-				g_fnLobbyChatOutput = nullptr;
-				g_fnAnticheatIntegrityViolationOccurredCallback = nullptr;
-				g_fnAnticheatActionCallback = nullptr;
-				g_fnSendMessageViaTransport = nullptr;
-				g_LoginCallback = nullptr;
-			}
+			// Fully tear down the EOS SDK so its internal threads and atexit
+			// handlers do not fire after the DLL has been unloaded, which would
+			// cause an EXCEPTION_ACCESS_VIOLATION_WRITE at address 0x0.
+			// Shutdown() is idempotent: it checks g_EOSPlatformHandle first.
+			Shutdown();
 			break;
 		}
 	}
@@ -335,6 +347,20 @@ int Initialize()
         
         std::string ExePath = std::string(buffer).substr(0, pos);
 
+        // Validate that the exe path contains only ASCII characters.
+        // Non-ASCII characters (e.g. Cyrillic in a copied installation directory)
+        // can cause EOS SDK path APIs to silently return null handles, leading to
+        // an EXCEPTION_ACCESS_VIOLATION_WRITE at shutdown.
+        for (unsigned char c : ExePath)
+        {
+            if (c > 127)
+            {
+                PluginLog("FATAL ERROR: Game installation path contains non-ASCII characters: %s", ExePath.c_str());
+                PluginLog("FATAL ERROR: Please move the game to a directory with only ASCII characters (A-Z, 0-9, etc.).");
+                return 1;
+            }
+        }
+
         std::string XAudio29DllPath = ExePath;
         XAudio29DllPath.append("\\xaudio2_9redist.dll");
 
@@ -407,11 +433,14 @@ int Initialize()
 PLUGIN_API void Shutdown()
 {
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	if (g_EOSPlatformHandle != nullptr)
+	if (g_EOSPlatformHandle == nullptr)
 	{
-		EOS_Platform_Release(g_EOSPlatformHandle);
-		g_EOSPlatformHandle = nullptr;
+		// Already shut down or never initialized; nothing to do.
+		return;
 	}
+
+	EOS_Platform_Release(g_EOSPlatformHandle);
+	g_EOSPlatformHandle = nullptr;
 
 	EOS_Shutdown();
 	
