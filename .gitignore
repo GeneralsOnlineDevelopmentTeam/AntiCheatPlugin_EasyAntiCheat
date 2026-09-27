@@ -1,0 +1,39 @@
+# ------------------------------------------------------------
+# CMake / build output
+#
+# NOTE: the generated CMakeCache.txt and *.vcxproj embed the EOS client secret
+# passed via -DEAC_EOS_CLIENT_SECRET. They must never be committed.
+# ------------------------------------------------------------
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+*.cmake.in
+
+# Visual Studio / MSBuild
+.vs/
+*.sln
+*.slnx
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.VC.db
+*.VC.opendb
+
+# Compiler and linker output
+*.obj
+*.o
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.dll
+*.exe
+*.log
+*.tlog
+
+# EOS SDK - the builder supplies their own copy
+EOS/

@@ -12,8 +12,11 @@
 #include <chrono>
 #include <mutex>
 #include <atomic>
+#include <vector>
+#include <utility>
 
 // Epic SDK
+#include <unordered_map>
 #include "EOS/Include/eos_types.h"
 #include "EOS/Include/eos_base.h"
 #include "EOS/Include/eos_integratedplatform_types.h"
@@ -22,6 +25,7 @@
 #include "EOS/Include/Windows/eos_Windows.h"
 #include "EOS/Include/eos_logging.h"
 #include "EOS/Include/eos_sdk.h"
+#include "EOS/Include/eos_p2p.h"
 #include "EOS/Include/eos_anticheatclient.h"
 #include "EOS/Include/eos_anticheatcommon_types.h"
 
@@ -37,6 +41,13 @@
 #else
 #define PLUGIN_API extern "C"
 #endif
+
+// Maps a middleware (EOS ProductUserId) string to the game's user ID.
+// Defined in plugin_eac.cpp; guarded by g_UserMapMutex.
+extern std::unordered_map<std::string, uint32_t> g_UserMap;
+
+extern std::unordered_map<std::string, EOS_ENetworkConnectionType> g_ConnectionType;
+extern std::mutex g_ConnectionTypeMutex;
 
 // ------------------------------------------------------------
 // Callback Types
@@ -144,10 +155,10 @@ PLUGIN_API void RefreshToken(const char* gameToken, LoginCallback cb);
 // Transport API
 //
 // The game resolves every one of these at load time and unloads the plugin if
-// any is missing, so they must always be exported. This plugin does not provide
-// its own secure transport: DoesACPluginProvideSecureGameTransport() returns
-// false and the game keeps using its own mesh/WebSocket transport, which means
-// the remaining entry points are never driven by the game.
+// any is missing, so they must always be exported. This plugin DOES provide its
+// own secure transport: DoesACPluginProvideSecureGameTransport() returns true
+// and the game routes both game and anti-cheat traffic through the EOS P2P
+// implementation below instead of its own mesh/WebSocket transport.
 // ------------------------------------------------------------
 PLUGIN_API bool DoesACPluginProvideSecureGameTransport();
 PLUGIN_API void StartSignalling(const char* middlewareUserID, uint64_t goUserID);

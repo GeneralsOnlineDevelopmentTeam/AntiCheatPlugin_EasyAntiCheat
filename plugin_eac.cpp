@@ -1,4 +1,7 @@
 #include "plugin_eac.h"
+#include <unordered_map>
+#include <unordered_set>
+#include "EOS/Include/eos_p2p_types.h"
 
 // ------------------------------------------------------------
 // Global definitions (declared extern in plugin_eac.h)
@@ -7,6 +10,12 @@ std::atomic<LoggingFunc> g_fnLoggingFunc{ nullptr };
 std::atomic<LoggingFunc> g_fnLobbyChatOutput{ nullptr };
 EOS_HPlatform g_EOSPlatformHandle = nullptr;
 std::recursive_mutex g_StateMutex;
+
+// Last reported EOS network connection type per middleware user ID, used by
+// IsConnectionRelayed(). Written from EOS worker threads in
+// ReportConnectionState(), read on the game thread, so it carries its own lock.
+std::unordered_map<std::string, EOS_ENetworkConnectionType> g_ConnectionType;
+std::mutex g_ConnectionTypeMutex;
 
 EOS_ProductUserId g_EOSUserID = nullptr;
 uint32_t g_goUserID = 0;
@@ -25,6 +34,25 @@ EOS_NotificationId g_NotifyPeerActionRequiredId = 0;
 
 typedef void (*LoginCallback)(bool bSuccess);
 LoginCallback g_LoginCallback = nullptr;
+
+// Maps a middleware (EOS ProductUserId) string to the game's user ID.
+// Read from EOS worker threads inside the P2P notification handlers and written
+// by RegisterPlayer()/DeregisterPlayer(), so it carries its own lock. If both
+// locks are needed, g_StateMutex must always be acquired first.
+std::unordered_map<std::string, uint32_t> g_UserMap;
+static std::mutex g_UserMapMutex;
+
+// Middleware user IDs whose incoming connection request arrived before the game
+// had registered them. EOS never re-delivers a connection request, so remember
+// it here and accept it as soon as RegisterPlayer() vouches for the peer.
+// Guarded by g_UserMapMutex.
+static std::unordered_set<std::string> g_PendingConnectionRequests;
+
+// Round-trip latency per middleware user ID, in milliseconds. Populated by the
+// ping/pong exchange driven from Tick(); read by GetConnectionLatencyForUser()
+// on the game thread.
+static std::unordered_map<std::string, uint32_t> g_LatencyMs;
+static std::mutex g_LatencyMutex;
 
 // ------------------------------------------------------------
 // EOS deployment credentials
@@ -118,6 +146,31 @@ void PluginLog(const char* fmt, ...)
 	sink(buffer);
 }
 
+// Writes a line to the game's lobby chat window, if the host has installed a
+// sink. Like PluginLog() this takes no lock so it is safe to call from EOS
+void LobbyChatLog(const char* fmt, ...)
+{
+	if (fmt == nullptr)
+	{
+		return;
+	}
+
+	LoggingFunc sink = g_fnLobbyChatOutput.load(std::memory_order_acquire);
+	if (sink == nullptr)
+	{
+		return;
+	}
+
+	char buffer[8192];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(buffer, sizeof(buffer), fmt, args);
+	buffer[sizeof(buffer) - 1] = 0;
+	va_end(args);
+
+	sink(buffer);
+}
+
 // Returns the anti-cheat client interface, or nullptr if the platform has not
 // been initialised. EOS_Platform_GetAntiCheatClientInterface() dereferences its
 // argument, so the platform handle must never be passed through as null.
@@ -130,6 +183,206 @@ static EOS_HAntiCheatClient GetAntiCheatHandle()
 	}
 
 	return EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+}
+
+// Returns the P2P interface, or nullptr if the platform has not been
+// initialised (EOS_Platform_GetP2PInterface() dereferences its argument).
+// Must be called with g_StateMutex held.
+static EOS_HP2P GetP2PHandle()
+{
+	if (g_EOSPlatformHandle == nullptr)
+	{
+		return nullptr;
+	}
+
+	return EOS_Platform_GetP2PInterface(g_EOSPlatformHandle);
+}
+
+// EOS_ProductUserId_ToString() requires a buffer of EOS_PRODUCTUSERID_MAX_LENGTH + 1
+// bytes; anything smaller fails with EOS_LimitExceeded and leaves the buffer
+// untouched, so the result must always be checked before reading it.
+static bool ProductUserIdToString(EOS_ProductUserId userId, std::string& outString)
+{
+	if (userId == nullptr)
+	{
+		return false;
+	}
+
+	char buffer[EOS_PRODUCTUSERID_MAX_LENGTH + 1] = {};
+	int32_t outLength = (int32_t)sizeof(buffer);
+
+	if (EOS_ProductUserId_ToString(userId, buffer, &outLength) != EOS_EResult::EOS_Success)
+	{
+		return false;
+	}
+
+	outString.assign(buffer);
+	return true;
+}
+
+// Thread-safe lookup of the game user ID associated with a middleware user ID.
+static bool TryGetGoUserID(const std::string& middlewareUserID, uint32_t& outGoUserID)
+{
+	std::lock_guard<std::mutex> lock(g_UserMapMutex);
+
+	auto it = g_UserMap.find(middlewareUserID);
+	if (it == g_UserMap.end())
+	{
+		return false;
+	}
+
+	outGoUserID = it->second;
+	return true;
+}
+
+// Reports a peer's connection state change to the game. Shared by all four P2P
+// notification handlers, which run on EOS worker threads: the user map needs its
+// own lock and the host callbacks may be null.
+static void ReportConnectionState(EOS_ProductUserId remoteUserId, const char* description, EConnectionState state, EOS_ENetworkConnectionType connectionType)
+{
+	if (state == EConnectionState::CONNECTED_DIRECT)
+	{
+		std::lock_guard<std::mutex> lock(g_ConnectionTypeMutex);
+
+		char szBuffer[EOS_PRODUCTUSERID_MAX_LENGTH + 1] = { 0 };
+		int32_t outLen = sizeof(szBuffer);
+		EOS_ProductUserId_ToString(remoteUserId, szBuffer, &outLen);
+		g_ConnectionType[szBuffer] = connectionType;
+
+		if (connectionType == EOS_ENetworkConnectionType::EOS_NCT_NoConnection)
+		{
+			PluginLog("[EAC] Connection type is NoConnection, invalid state");
+		}
+	}
+
+	std::string middlewareUserID;
+	if (!ProductUserIdToString(remoteUserId, middlewareUserID))
+	{
+		PluginLog("[EAC] %s: could not resolve remote product user ID", description);
+		return;
+	}
+
+	uint32_t goUserID = 0;
+	if (!TryGetGoUserID(middlewareUserID, goUserID))
+	{
+		// Not a player we know about - ignore rather than reporting a bogus user
+		// ID of 0 to the game.
+		PluginLog("[EAC] %s: unknown peer %s, ignoring", description, middlewareUserID.c_str());
+		return;
+	}
+
+	auto fn = g_fnLobbyChatOutput.load();
+	if (fn != nullptr)
+	{
+		std::string strMessage = std::format("{} {} [{}]", description, middlewareUserID, goUserID);
+		fn(strMessage.c_str());
+	}
+
+	ConnectionStateChangedCallbackFunc stateCallback = nullptr;
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+		stateCallback = g_fnConnectionStateChanged;
+	}
+
+	if (stateCallback != nullptr)
+	{
+		stateCallback(middlewareUserID.c_str(), goUserID, state);
+	}
+}
+
+// ------------------------------------------------------------
+// NAT type detection
+// ------------------------------------------------------------
+
+// Most recent NAT type reported by EOS. Written from an EOS worker thread in
+// the query callback and read from game threads, so it is atomic.
+static std::atomic<EOS_ENATType> g_LocalNATType{ EOS_ENATType::EOS_NAT_Unknown };
+
+static const char* NATTypeToString(EOS_ENATType natType)
+{
+	switch (natType)
+	{
+	case EOS_ENATType::EOS_NAT_Open:
+		return "Open - all peers can connect directly to you";
+	case EOS_ENATType::EOS_NAT_Moderate:
+		return "Moderate - you can connect directly to Open and Moderate peers";
+	case EOS_ENATType::EOS_NAT_Strict:
+		return "Strict - you can only connect directly to Open peers, other traffic is relayed";
+	case EOS_ENATType::EOS_NAT_Unknown:
+	default:
+		return "Unknown - EOS could not determine your NAT type";
+	}
+}
+
+// Asks EOS to determine how strict the local NAT is. The query is asynchronous;
+// the answer is logged and echoed into lobby chat from the completion callback,
+// which runs on an EOS worker thread during EOS_Platform_Tick().
+static void QueryLocalNATType()
+{
+	EOS_HP2P p2pHandle = nullptr;
+
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+		p2pHandle = GetP2PHandle();
+	}
+
+	if (p2pHandle == nullptr)
+	{
+		PluginLog("[EAC] NAT: P2P interface unavailable, cannot query NAT type");
+		return;
+	}
+
+	// EOS caches the last known result, so report it immediately rather than
+	// leaving the player with nothing while the (slow) query runs.
+	EOS_P2P_GetNATTypeOptions getOptions = {};
+	getOptions.ApiVersion = EOS_P2P_GETNATTYPE_API_LATEST;
+
+	EOS_ENATType cachedNATType = EOS_ENATType::EOS_NAT_Unknown;
+	EOS_EResult getResult = EOS_P2P_GetNATType(p2pHandle, &getOptions, &cachedNATType);
+
+	if (getResult == EOS_EResult::EOS_Success && cachedNATType != EOS_ENATType::EOS_NAT_Unknown)
+	{
+		g_LocalNATType.store(cachedNATType, std::memory_order_release);
+		PluginLog("[EAC] NAT: cached NAT type is %s", NATTypeToString(cachedNATType));
+		LobbyChatLog("[NAT] Your NAT type: %s", NATTypeToString(cachedNATType));
+	}
+
+	EOS_P2P_QueryNATTypeOptions queryOptions = {};
+	queryOptions.ApiVersion = EOS_P2P_QUERYNATTYPE_API_LATEST;
+
+	PluginLog("[EAC] NAT: querying NAT type...");
+
+	EOS_P2P_QueryNATType(p2pHandle, &queryOptions, nullptr,
+		[](const EOS_P2P_OnQueryNATTypeCompleteInfo* Data)
+		{
+			if (Data == nullptr)
+			{
+				return;
+			}
+
+			if (Data->ResultCode != EOS_EResult::EOS_Success)
+			{
+				PluginLog("[EAC] NAT: query failed: %s", EOS_EResult_ToString(Data->ResultCode));
+				LobbyChatLog("[NAT] Could not determine your NAT type (%s)", EOS_EResult_ToString(Data->ResultCode));
+				return;
+			}
+
+			const EOS_ENATType previousNATType = g_LocalNATType.exchange(Data->NATType, std::memory_order_acq_rel);
+
+			PluginLog("[EAC] NAT: local NAT type is %s", NATTypeToString(Data->NATType));
+
+			// Only spam lobby chat when this actually tells the player something
+			// new - QueryLocalNATType() already printed any cached value.
+			if (previousNATType != Data->NATType)
+			{
+				LobbyChatLog("[NAT] Your NAT type: %s", NATTypeToString(Data->NATType));
+			}
+
+			if (Data->NATType == EOS_ENATType::EOS_NAT_Strict)
+			{
+				LobbyChatLog("[NAT] A strict NAT can cause connection problems. Enabling UPnP or forwarding ports on your router will help.");
+			}
+		});
 }
 
 // Atomically detaches the pending login callback and invokes it without holding
@@ -214,12 +467,57 @@ void ACMessageArrivedViaTransport(uint32_t sourceUserID, void* data, uint32_t da
 	}
 }
 
+// ------------------------------------------------------------
+// Ping / pong latency measurement
+//
+// Every PING_INTERVAL the plugin sends a timestamped ping to each registered
+// peer on ENetworkChannels::Ping. Peers echo the payload back byte-for-byte on
+// ENetworkChannels::Pong, so the original sender can derive a round-trip time
+// against its own clock - neither side needs a synchronised clock. The game
+// never sees these channels; it only reads the result via
+// GetConnectionLatencyForUser().
+// ------------------------------------------------------------
+#pragma pack(push, 1)
+struct PingPayload
+{
+	uint32_t Magic;
+	uint64_t SentMicroseconds;
+};
+#pragma pack(pop)
+
+// 'GOPG' - guards against a stray packet on the ping channels being treated as
+// a timestamp.
+static constexpr uint32_t PING_PAYLOAD_MAGIC = 0x474F5047u;
+static constexpr std::chrono::milliseconds PING_INTERVAL{ 1000 };
+
+// Anything above this is treated as a bogus sample rather than real latency.
+static constexpr uint64_t PING_MAX_PLAUSIBLE_RTT_MICROSECONDS = 30ull * 1000ull * 1000ull;
+
+static std::chrono::steady_clock::time_point g_LastPingSendTime{};
+
+// Defined below the transport section; driven from Tick().
+static void ProcessIncomingPings();
+static void ProcessIncomingPongs();
+static void SendPingsIfDue();
+
+static uint64_t NowMicroseconds()
+{
+	return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void Tick()
 {
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	if (g_EOSPlatformHandle != nullptr)
 	{
 		EOS_Platform_Tick(g_EOSPlatformHandle);
+
+		// Answer any pings we have been sent, then fold the replies to our own
+		// pings into the latency table, then send the next round.
+		ProcessIncomingPings();
+		ProcessIncomingPongs();
+		SendPingsIfDue();
 	}
 }
 
@@ -312,9 +610,55 @@ bool GetMiddlewareAuthToken(char* buffer, size_t bufferSize)
 	return bSuccess;
 }
 
+EOS_NotificationId g_ConnectionRequestNotificationId = EOS_INVALID_NOTIFICATIONID;
+EOS_NotificationId g_ConnectionEstablishedNotificationId = EOS_INVALID_NOTIFICATIONID;
+EOS_NotificationId g_ConnectionInterruptedNotificationId = EOS_INVALID_NOTIFICATIONID;
+EOS_NotificationId g_ConnectionClosedNotificationId = EOS_INVALID_NOTIFICATIONID;
+
+EOS_P2P_SocketId g_SocketId = {};
+
+// Removes every P2P notification we registered. Safe to call with a null handle
+// or with nothing registered. Must be called with g_StateMutex held, and always
+// before the platform that owns the notifications is released.
+static void RemoveP2PNotifications(EOS_HP2P p2pHandle)
+{
+	if (p2pHandle != nullptr)
+	{
+		if (g_ConnectionRequestNotificationId != EOS_INVALID_NOTIFICATIONID)
+		{
+			EOS_P2P_RemoveNotifyPeerConnectionRequest(p2pHandle, g_ConnectionRequestNotificationId);
+		}
+
+		if (g_ConnectionEstablishedNotificationId != EOS_INVALID_NOTIFICATIONID)
+		{
+			EOS_P2P_RemoveNotifyPeerConnectionEstablished(p2pHandle, g_ConnectionEstablishedNotificationId);
+		}
+
+		if (g_ConnectionInterruptedNotificationId != EOS_INVALID_NOTIFICATIONID)
+		{
+			EOS_P2P_RemoveNotifyPeerConnectionInterrupted(p2pHandle, g_ConnectionInterruptedNotificationId);
+		}
+
+		if (g_ConnectionClosedNotificationId != EOS_INVALID_NOTIFICATIONID)
+		{
+			EOS_P2P_RemoveNotifyPeerConnectionClosed(p2pHandle, g_ConnectionClosedNotificationId);
+		}
+	}
+
+	// Always reset the IDs: they belong to the platform that is going away and
+	// must never be reused against a future one.
+	g_ConnectionRequestNotificationId = EOS_INVALID_NOTIFICATIONID;
+	g_ConnectionEstablishedNotificationId = EOS_INVALID_NOTIFICATIONID;
+	g_ConnectionInterruptedNotificationId = EOS_INVALID_NOTIFICATIONID;
+	g_ConnectionClosedNotificationId = EOS_INVALID_NOTIFICATIONID;
+}
+
 int Initialize(ConnectionStateChangedCallbackFunc connectionStateChangedCB)
 {
     std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+
+	g_SocketId.ApiVersion = EOS_P2P_SOCKETID_API_LATEST;
+	strncpy_s(g_SocketId.SocketName, sizeof(g_SocketId.SocketName), "GO_SOCKET", _TRUNCATE);
 
     // The game hands this in on every Initialize() call, keep the latest one even
     // if we early out below so a re-init can't leave a stale pointer behind.
@@ -325,6 +669,20 @@ int Initialize(ConnectionStateChangedCallbackFunc connectionStateChangedCB)
     {
         PluginLog("[EAC] Already initialized - skipping re-initialization");
         return EInitializeResult_Success;
+    }
+
+    // NOTE: only wipe the player map on a genuine (re-)initialisation. Doing this
+    // above the early-out would clear every registered player if the game called
+    // Initialize() again mid-session.
+    {
+        std::lock_guard<std::mutex> userMapLock(g_UserMapMutex);
+        g_UserMap.clear();
+        g_PendingConnectionRequests.clear();
+    }
+
+    {
+        std::lock_guard<std::mutex> latencyLock(g_LatencyMutex);
+        g_LatencyMs.clear();
     }
 
     // Refuse to run with placeholder credentials: EOS_Platform_Create() would
@@ -417,7 +775,13 @@ int Initialize(ConnectionStateChangedCallbackFunc connectionStateChangedCB)
 
         PlatformOptions.ProductId = EAC_EOS_PRODUCT_ID;
         PlatformOptions.SandboxId = EAC_EOS_SANDBOX_ID;
-        PlatformOptions.EncryptionKey = "1111111111111111111111111111111111111111111111111111111"; // NOTE: unused
+
+        // Only used by Player Data Storage / Title Storage, neither of which this
+        // plugin touches. eos_types.h requires it to be null when unused, or
+        // exactly EOS_PLATFORM_OPTIONS_ENCRYPTIONKEY_LENGTH (64) hex characters -
+        // a shorter placeholder is rejected rather than ignored.
+        PlatformOptions.EncryptionKey = nullptr;
+
         PlatformOptions.DeploymentId = EAC_EOS_DEPLOYMENT_ID;
 
         PlatformOptions.ClientCredentials.ClientId = EAC_EOS_CLIENT_ID;
@@ -552,6 +916,10 @@ PLUGIN_API void Shutdown()
 		return;
 	}
 
+	// P2P notifications belong to the platform we are about to release, so they
+	// must be unsubscribed first.
+	RemoveP2PNotifications(GetP2PHandle());
+
 	EOS_Platform_Release(g_EOSPlatformHandle);
 	g_EOSPlatformHandle = nullptr;
 
@@ -579,6 +947,8 @@ bool IsExternalProcessRunning()
 #if _DEBUG
 	return true;
 #else
+	// TODO_EOS: Restore once EAC is active
+	return true;
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	return GetAntiCheatHandle() != nullptr;
 #endif
@@ -592,74 +962,651 @@ PLUGIN_API int GetAnticheatIdentifier()
 // ------------------------------------------------------------
 // Transport API
 //
-// This plugin runs anti-cheat only, it does not own a game transport. The game
-// still resolves all of these exports at load time and unloads the plugin if any
-// is missing, so they are exported as well-defined no-ops. Because
-// DoesACPluginProvideSecureGameTransport() reports false, the game routes both
-// game and anti-cheat traffic over its own mesh/WebSocket transport and never
-// calls the remaining functions.
+// This plugin owns the game transport: DoesACPluginProvideSecureGameTransport()
+// reports true, so the game routes both game and anti-cheat traffic through the
+// EOS P2P implementation below instead of its own mesh/WebSocket transport.
+//
+// Every entry point here can be called before Login() or after Shutdown(), so
+// they all validate the platform handle and the local user ID before touching
+// the SDK - EOS_Platform_GetP2PInterface(nullptr) would access-violate.
 // ------------------------------------------------------------
 PLUGIN_API bool DoesACPluginProvideSecureGameTransport()
 {
-	return false;
+	return true;
+}
+
+// Grabs everything needed to talk to the P2P interface. Returns false (and logs)
+// if the transport is not usable yet.
+static bool AcquireP2PContext(const char* context, EOS_HP2P& outHandle, EOS_ProductUserId& outLocalUser)
+{
+	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+
+	outHandle = GetP2PHandle();
+	outLocalUser = g_EOSUserID;
+
+	if (outHandle == nullptr)
+	{
+		PluginLog("[EAC] %s: P2P interface unavailable (platform not initialised)", context);
+		return false;
+	}
+
+	if (outLocalUser == nullptr)
+	{
+#if _DEBUG
+		PluginLog("[EAC] %s: no local EOS user (not logged in)", context);
+#endif
+		return false;
+	}
+
+	return true;
+}
+
+// Parses a middleware user ID, logging and failing instead of handing a null
+// (or a null-derived) product user ID to the SDK.
+static bool ResolveRemoteUser(const char* context, const char* middlewareUserID, EOS_ProductUserId& outRemoteUser)
+{
+	if (middlewareUserID == nullptr || middlewareUserID[0] == '\0')
+	{
+		PluginLog("[EAC] %s: null/empty middleware user ID", context);
+		return false;
+	}
+
+	outRemoteUser = EOS_ProductUserId_FromString(middlewareUserID);
+
+	if (outRemoteUser == nullptr)
+	{
+		PluginLog("[EAC] %s: malformed middleware user ID '%s'", context, middlewareUserID);
+		return false;
+	}
+
+	return true;
+}
+
+// Accepts an incoming P2P connection from a peer the game has vouched for.
+// Callers must have confirmed the peer is registered; this only performs the
+// EOS side of the handshake.
+static bool AcceptP2PConnection(const char* context, EOS_ProductUserId remoteUser, const char* middlewareUserID)
+{
+	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+
+	EOS_HP2P p2pHandle = GetP2PHandle();
+
+	if (p2pHandle == nullptr || g_EOSUserID == nullptr || remoteUser == nullptr)
+	{
+		return false;
+	}
+
+	EOS_P2P_AcceptConnectionOptions acceptOptions = {};
+	acceptOptions.ApiVersion = EOS_P2P_ACCEPTCONNECTION_API_LATEST;
+	acceptOptions.LocalUserId = g_EOSUserID;
+	acceptOptions.RemoteUserId = remoteUser;
+	acceptOptions.SocketId = &g_SocketId;
+
+	EOS_EResult acceptResult = EOS_P2P_AcceptConnection(p2pHandle, &acceptOptions);
+
+	if (acceptResult != EOS_EResult::EOS_Success)
+	{
+		PluginLog("[EAC] %s: failed to accept connection from %s: %s",
+			context, middlewareUserID, EOS_EResult_ToString(acceptResult));
+		return false;
+	}
+
+	return true;
+}
+
+static void LogSendPacketResult(const char* context, const char* middlewareUserID, EOS_EResult result)
+{
+	if (result == EOS_EResult::EOS_Success)
+	{
+		return;
+	}
+
+	if (result == EOS_EResult::EOS_LimitExceeded)
+	{
+		PluginLog("[EAC] %s: packet to %s rejected - too large or outgoing queue full (%s)",
+			context, middlewareUserID, EOS_EResult_ToString(result));
+	}
+	else
+	{
+		PluginLog("[EAC] %s: failed to send packet to %s: %s",
+			context, middlewareUserID, EOS_EResult_ToString(result));
+	}
 }
 
 PLUGIN_API void StartSignalling(const char* middlewareUserID, uint64_t goUserID)
 {
-	(void)middlewareUserID;
 	(void)goUserID;
+
+	EOS_HP2P P2PHandle = nullptr;
+	EOS_ProductUserId localUser = nullptr;
+	EOS_ProductUserId targetPUID = nullptr;
+
+	if (!AcquireP2PContext("StartSignalling", P2PHandle, localUser) ||
+		!ResolveRemoteUser("StartSignalling", middlewareUserID, targetPUID))
+	{
+		return;
+	}
+
+	// Drop any existing connection to this peer before signalling again.
+	//
+	// EOS keeps P2P connections alive across sessions, and the connection
+	// notifications are edge-triggered: if EOS still considers us connected from
+	// a previous match, re-signalling raises neither OnIncomingConnectionRequest
+	// on the remote nor OnPeerConnectionEstablished here, so the game waits
+	// forever for a peer it can never observe connecting. Closing first also
+	// avoids the half-open, single-direction state the game warns about in
+	// NetworkMesh::StartConnectionSignalling().
+	EOS_P2P_CloseConnectionOptions closeOptions = {};
+	closeOptions.ApiVersion = EOS_P2P_CLOSECONNECTION_API_LATEST;
+	closeOptions.LocalUserId = localUser;
+	closeOptions.RemoteUserId = targetPUID;
+	closeOptions.SocketId = &g_SocketId;
+
+	const EOS_EResult closeResult = EOS_P2P_CloseConnection(P2PHandle, &closeOptions);
+
+	// EOS_NotFound just means there was nothing to close, which is the normal
+	// first-connection case.
+	if (closeResult != EOS_EResult::EOS_Success && closeResult != EOS_EResult::EOS_NotFound)
+	{
+		PluginLog("[EAC] StartSignalling: could not drop stale connection to %s: %s",
+			middlewareUserID, EOS_EResult_ToString(closeResult));
+	}
+
+	// Set the options for sending the message.
+	EOS_P2P_SendPacketOptions SendPacketOptions = {};
+	SendPacketOptions.ApiVersion = EOS_P2P_SENDPACKET_API_LATEST;
+
+	// Set the Product User ID of the local player sending a message.
+	SendPacketOptions.LocalUserId = localUser;
+
+	// Set the Product User ID of the remote player to send a message to.
+	SendPacketOptions.RemoteUserId = targetPUID;
+
+	// Set the socket ID for the P2P connection.
+	SendPacketOptions.SocketId = &g_SocketId;
+
+	// Set a boolean to specify whether to delay sending the message if the remote player is not currently connected.
+	// If you set this to false and a connection is not established with the peer, this data will be dropped.
+	SendPacketOptions.bAllowDelayedDelivery = EOS_TRUE;
+
+	// Signalling has its own channel so it can never be confused with game or
+	// anti-cheat traffic on the receiving side.
+	SendPacketOptions.Channel = (uint8_t)ENetworkChannels::Signalling;
+
+	// Set an enum to indicate the reliability and order of sent packets. 
+	SendPacketOptions.Reliability = EOS_EPacketReliability::EOS_PR_ReliableOrdered;
+
+	// We are the initiator here and the target was chosen by the game, so the
+	// outgoing connection is opened automatically. Inbound connection requests
+	// are NOT automatic: they are vetted against g_UserMap and explicitly
+	// accepted in the EOS_P2P_AddNotifyPeerConnectionRequest handler.
+	SendPacketOptions.bDisableAutoAcceptConnection = EOS_FALSE;
+
+	// Set the length in bytes of the message to send to the remote player.
+	std::string Message = "HELLO";
+	SendPacketOptions.DataLengthBytes = static_cast<uint32_t>(Message.length());
+
+	// Set the message to send to the remote player.
+	SendPacketOptions.Data = Message.data();
+
+	// Call the EOS SDK to send the message to the remote player. 
+	LogSendPacketResult("StartSignalling", middlewareUserID, EOS_P2P_SendPacket(P2PHandle, &SendPacketOptions));
 }
 
 PLUGIN_API void SendPacket(const char* middlewareUserID, uint64_t targetGoUserID, void* data, int numBytes, ENetworkChannels channel, EPacketReliability reliability)
 {
-	(void)middlewareUserID;
 	(void)targetGoUserID;
-	(void)data;
-	(void)numBytes;
-	(void)channel;
-	(void)reliability;
+
+	if (data == nullptr || numBytes <= 0)
+	{
+		PluginLog("[EAC] SendPacket: refusing to send %d bytes from %p", numBytes, data);
+		return;
+	}
+
+	if (numBytes > EOS_P2P_MAX_PACKET_SIZE)
+	{
+		PluginLog("[EAC] SendPacket: packet of %d bytes exceeds the EOS maximum of %d - dropping",
+			numBytes, (int)EOS_P2P_MAX_PACKET_SIZE);
+		return;
+	}
+
+	EOS_HP2P P2PHandle = nullptr;
+	EOS_ProductUserId localUser = nullptr;
+	EOS_ProductUserId targetPUID = nullptr;
+
+	if (!AcquireP2PContext("SendPacket", P2PHandle, localUser) ||
+		!ResolveRemoteUser("SendPacket", middlewareUserID, targetPUID))
+	{
+		return;
+	}
+
+	// Set the options for sending the message.
+	EOS_P2P_SendPacketOptions SendPacketOptions = {};
+	SendPacketOptions.ApiVersion = EOS_P2P_SENDPACKET_API_LATEST;
+
+	// Set the Product User ID of the local player sending a message.
+	SendPacketOptions.LocalUserId = localUser;
+
+	// Set the Product User ID of the remote player to send a message to.
+	SendPacketOptions.RemoteUserId = targetPUID;
+
+	// Set the socket ID for the P2P connection.
+	SendPacketOptions.SocketId = &g_SocketId;
+
+	// Set a boolean to specify whether to delay sending the message if the remote player is not currently connected.
+	// If you set this to false and a connection is not established with the peer, this data will be dropped.
+	SendPacketOptions.bAllowDelayedDelivery = EOS_TRUE;
+
+	// Send on the channel the game asked for. The game polls each channel
+	// separately in RecvPacket(), so forcing everything onto one channel here
+	// would make the traffic undeliverable.
+	SendPacketOptions.Channel = (uint8_t)channel;
+
+	// Set an enum to indicate the reliability and order of sent packets. 
+	if (reliability == EPacketReliability::PACKET_RELIABILITY_UNRELIABLE_UNORDERED)
+	{
+		SendPacketOptions.Reliability = EOS_EPacketReliability::EOS_PR_UnreliableUnordered;
+	}
+	else if (reliability == EPacketReliability::PACKET_RELIABILITY_RELIABLE_UNORDERED)
+	{
+		SendPacketOptions.Reliability = EOS_EPacketReliability::EOS_PR_ReliableUnordered;
+	}
+	else if (reliability == EPacketReliability::PACKET_RELIABILITY_RELIABLE_ORDERED)
+	{
+		SendPacketOptions.Reliability = EOS_EPacketReliability::EOS_PR_ReliableOrdered;
+	}
+	else
+	{
+		PluginLog("[EAC] SendPacket: unknown reliability %d, defaulting to reliable-ordered", (int)reliability);
+		SendPacketOptions.Reliability = EOS_EPacketReliability::EOS_PR_ReliableOrdered;
+	}
+
+	// See StartSignalling(): inbound connections are vetted in the connection
+	// request handler, outbound ones are initiated deliberately by the game.
+	SendPacketOptions.bDisableAutoAcceptConnection = EOS_FALSE;
+
+	// Set the length in bytes of the message to send to the remote player.
+	SendPacketOptions.DataLengthBytes = (uint32_t)numBytes;
+
+	// Set the message to send to the remote player.
+	SendPacketOptions.Data = data;
+
+	// Call the EOS SDK to send the message to the remote player. 
+	LogSendPacketResult("SendPacket", middlewareUserID, EOS_P2P_SendPacket(P2PHandle, &SendPacketOptions));
+}
+
+// Core receive used by both the exported RecvPacket() and the internal
+// ping/pong handling. Fills a caller-owned buffer and reports which peer the
+// packet came from.
+static bool ReceivePacketCore(const char* context, uint8_t channelToReceiveOn, uint8_t* buffer, uint32_t bufferSize, uint32_t& outBytesWritten, EOS_ProductUserId& outSender)
+{
+	outBytesWritten = 0;
+	outSender = nullptr;
+
+	EOS_HP2P P2PHandle = nullptr;
+	EOS_ProductUserId localUser = nullptr;
+
+	if (!AcquireP2PContext(context, P2PHandle, localUser))
+	{
+		return false;
+	}
+
+	EOS_P2P_ReceivePacketOptions Options = {};
+	Options.ApiVersion = EOS_P2P_RECEIVEPACKET_API_LATEST;
+	Options.LocalUserId = localUser;
+	Options.MaxDataSizeBytes = bufferSize;
+	Options.RequestedChannel = &channelToReceiveOn;
+
+	uint8_t channelReceivedOn = 0;
+
+	// NOTE: this is an OUT parameter - EOS overwrites it with the socket the
+	// packet arrived on, so it must be a local and never the shared g_SocketId.
+	EOS_P2P_SocketId receivedSocketId = {};
+
+	EOS_EResult Result = EOS_P2P_ReceivePacket(P2PHandle, &Options, &outSender, &receivedSocketId, &channelReceivedOn, buffer, &outBytesWritten);
+
+	if (Result != EOS_EResult::EOS_Success)
+	{
+		// EOS_NotFound simply means the queue is empty, which is the common case
+		// on every idle poll - anything else is a genuine error worth logging.
+		if (Result != EOS_EResult::EOS_NotFound)
+		{
+			PluginLog("[EAC] %s: channel %u failed: %s",
+				context, (unsigned)channelToReceiveOn, EOS_EResult_ToString(Result));
+		}
+
+		outBytesWritten = 0;
+		outSender = nullptr;
+		return false;
+	}
+
+	return true;
 }
 
 PLUGIN_API int GetNextRecvPacketSize(uint8_t channelToReceiveOn)
 {
-	(void)channelToReceiveOn;
-	return 0;
+	EOS_HP2P P2PHandle = nullptr;
+	EOS_ProductUserId localUser = nullptr;
+
+	if (!AcquireP2PContext("GetNextRecvPacketSize", P2PHandle, localUser))
+	{
+		return 0;
+	}
+
+	uint32_t size = 0;
+
+	EOS_P2P_GetNextReceivedPacketSizeOptions opts = {};
+	opts.ApiVersion = EOS_P2P_GETNEXTRECEIVEDPACKETSIZE_API_LATEST;
+	opts.LocalUserId = localUser;
+	opts.RequestedChannel = &channelToReceiveOn;
+
+	EOS_EResult result = EOS_P2P_GetNextReceivedPacketSize(P2PHandle, &opts, &size);
+
+	if (result != EOS_EResult::EOS_Success)
+	{
+		// EOS_NotFound simply means the queue is empty, which is the common case
+		// on every idle poll - anything else is a genuine error worth logging.
+		if (result != EOS_EResult::EOS_NotFound)
+		{
+			PluginLog("[EAC] GetNextRecvPacketSize: channel %u failed: %s",
+				(unsigned)channelToReceiveOn, EOS_EResult_ToString(result));
+		}
+
+		return 0;
+	}
+
+	return (int)size;
 }
 
 PLUGIN_API bool RecvPacket(uint8_t** outData, uint8_t channelToReceiveOn)
 {
-	(void)channelToReceiveOn;
-
-	if (outData != nullptr)
+	if (outData == nullptr)
 	{
-		*outData = nullptr;
+		return false;
 	}
 
-	return false;
+	*outData = nullptr;
+
+	int bufSize = GetNextRecvPacketSize(channelToReceiveOn);
+
+	if (bufSize <= 0)
+	{
+		return false;
+	}
+
+	uint8_t* pOutData = (uint8_t*)malloc((size_t)bufSize);
+
+	if (pOutData == nullptr)
+	{
+		PluginLog("[EAC] RecvPacket: out of memory allocating %d bytes", bufSize);
+		return false;
+	}
+
+	uint32_t bytesWritten = 0;
+	EOS_ProductUserId sender = nullptr;
+
+	if (!ReceivePacketCore("RecvPacket", channelToReceiveOn, pOutData, (uint32_t)bufSize, bytesWritten, sender))
+	{
+		free(pOutData);
+		return false;
+	}
+
+	// Hand ownership of the buffer to the game; it releases it via FreePacket().
+	*outData = pOutData;
+	return true;
 }
 
 PLUGIN_API void FreePacket(void* packetData)
 {
-	// Nothing is ever handed out by RecvPacket(), so there is nothing to release.
-	(void)packetData;
+	// Must match the malloc() in RecvPacket(). Using delete here would be both
+	// an allocator mismatch and undefined behaviour on a void*.
+	free(packetData);
+}
+
+PLUGIN_API bool IsConnectionRelayed(const char* middlewareUserID, uint32_t goUserID)
+{
+	(void)goUserID;
+
+	if (middlewareUserID == nullptr || middlewareUserID[0] == '\0')
+	{
+		return false;
+	}
+
+	std::lock_guard<std::mutex> lock(g_ConnectionTypeMutex);
+
+	auto it = g_ConnectionType.find(middlewareUserID);
+	if (it == g_ConnectionType.end())
+	{
+		return false;
+	}
+
+	return it->second == EOS_ENetworkConnectionType::EOS_NCT_RelayedConnection;
 }
 
 PLUGIN_API int GetConnectionLatencyForUser(const char* middlewareUserID, uint32_t goUserID)
 {
-	// No plugin-owned connections, the game measures latency on its own transport.
-	(void)middlewareUserID;
 	(void)goUserID;
-	return 0;
+
+	if (middlewareUserID == nullptr || middlewareUserID[0] == '\0')
+	{
+		return 0;
+	}
+
+	std::lock_guard<std::mutex> lock(g_LatencyMutex);
+
+	auto it = g_LatencyMs.find(middlewareUserID);
+	if (it == g_LatencyMs.end())
+	{
+		// No pong seen yet - the game treats 0 as "unknown".
+		return 0;
+	}
+
+	return (int)it->second;
 }
 
 PLUGIN_API void DisconnectPlayer(const char* middlewareUserID, uint64_t goUserID)
 {
-	(void)middlewareUserID;
 	(void)goUserID;
+
+	EOS_HP2P P2PHandle = nullptr;
+	EOS_ProductUserId localUser = nullptr;
+	EOS_ProductUserId targetPUID = nullptr;
+
+	if (!AcquireP2PContext("DisconnectPlayer", P2PHandle, localUser) ||
+		!ResolveRemoteUser("DisconnectPlayer", middlewareUserID, targetPUID))
+	{
+		return;
+	}
+
+	EOS_P2P_CloseConnectionOptions opts = {};
+	opts.ApiVersion = EOS_P2P_CLOSECONNECTION_API_LATEST;
+	opts.LocalUserId = localUser;
+	opts.RemoteUserId = targetPUID;
+	opts.SocketId = &g_SocketId;
+
+	EOS_EResult result = EOS_P2P_CloseConnection(P2PHandle, &opts);
+
+	if (result != EOS_EResult::EOS_Success)
+	{
+		PluginLog("[EAC] DisconnectPlayer: failed to close connection to %s: %s",
+			middlewareUserID, EOS_EResult_ToString(result));
+	}
 }
 
 PLUGIN_API void DisconnectAll()
 {
+	EOS_HP2P P2PHandle = nullptr;
+	EOS_ProductUserId localUser = nullptr;
+
+	if (!AcquireP2PContext("DisconnectAll", P2PHandle, localUser))
+	{
+		return;
+	}
+
+	EOS_P2P_CloseConnectionsOptions opts = {};
+	opts.ApiVersion = EOS_P2P_CLOSECONNECTIONS_API_LATEST;
+	opts.LocalUserId = localUser;
+	opts.SocketId = &g_SocketId;
+
+	EOS_EResult result = EOS_P2P_CloseConnections(P2PHandle, &opts);
+
+	if (result != EOS_EResult::EOS_Success)
+	{
+		PluginLog("[EAC] DisconnectAll: failed to close connections: %s", EOS_EResult_ToString(result));
+	}
+}
+
+// ------------------------------------------------------------
+// Ping / pong implementation (declared above Tick())
+// ------------------------------------------------------------
+
+// Reads one ping/pong payload out of the given channel. Returns false when the
+// queue is drained or the packet is not a well-formed payload from a peer we
+// know about; *outMore tells the caller whether to keep draining.
+static bool ReadPingPayload(const char* context, ENetworkChannels channel, PingPayload& outPayload, std::string& outSenderID, uint32_t& outSenderGoUserID, bool& outMore)
+{
+	uint8_t buffer[EOS_P2P_MAX_PACKET_SIZE] = {};
+	uint32_t bytesWritten = 0;
+	EOS_ProductUserId sender = nullptr;
+
+	if (!ReceivePacketCore(context, (uint8_t)channel, buffer, (uint32_t)sizeof(buffer), bytesWritten, sender))
+	{
+		outMore = false;
+		return false;
+	}
+
+	// A packet was consumed, so there may be more behind it even if this one is
+	// rejected below.
+	outMore = true;
+
+	if (bytesWritten != sizeof(PingPayload))
+	{
+		return false;
+	}
+
+	memcpy(&outPayload, buffer, sizeof(PingPayload));
+
+	if (outPayload.Magic != PING_PAYLOAD_MAGIC)
+	{
+		return false;
+	}
+
+	if (!ProductUserIdToString(sender, outSenderID))
+	{
+		return false;
+	}
+
+	// Only talk to players the game registered for this session.
+	return TryGetGoUserID(outSenderID, outSenderGoUserID);
+}
+
+static void ProcessIncomingPings()
+{
+	bool bMore = true;
+
+	while (bMore)
+	{
+		PingPayload payload = {};
+		std::string senderID;
+		uint32_t senderGoUserID = 0;
+
+		if (!ReadPingPayload("Ping", ENetworkChannels::Ping, payload, senderID, senderGoUserID, bMore))
+		{
+			continue;
+		}
+
+		// Echo the payload back verbatim: SentMicroseconds belongs to the
+		// sender's clock and must not be rewritten, otherwise the RTT it
+		// computes would be meaningless.
+		SendPacket(senderID.c_str(), senderGoUserID, &payload, (int)sizeof(payload),
+			ENetworkChannels::Pong, EPacketReliability::PACKET_RELIABILITY_UNRELIABLE_UNORDERED);
+	}
+}
+
+static void ProcessIncomingPongs()
+{
+	bool bMore = true;
+
+	while (bMore)
+	{
+		PingPayload payload = {};
+		std::string senderID;
+		uint32_t senderGoUserID = 0;
+
+		if (!ReadPingPayload("Pong", ENetworkChannels::Pong, payload, senderID, senderGoUserID, bMore))
+		{
+			continue;
+		}
+
+		const uint64_t nowMicroseconds = NowMicroseconds();
+
+		// The timestamp is one we generated, so anything in the future or
+		// implausibly old is a corrupt or replayed packet.
+		if (payload.SentMicroseconds > nowMicroseconds)
+		{
+			continue;
+		}
+
+		const uint64_t rttMicroseconds = nowMicroseconds - payload.SentMicroseconds;
+
+		if (rttMicroseconds > PING_MAX_PLAUSIBLE_RTT_MICROSECONDS)
+		{
+			continue;
+		}
+
+		const uint32_t rttMilliseconds = (uint32_t)((rttMicroseconds + 500ull) / 1000ull);
+
+		std::lock_guard<std::mutex> lock(g_LatencyMutex);
+
+		auto it = g_LatencyMs.find(senderID);
+		if (it == g_LatencyMs.end())
+		{
+			g_LatencyMs[senderID] = rttMilliseconds;
+		}
+		else
+		{
+			// Light smoothing so a single delayed pong does not make the
+			// displayed latency jump around.
+			it->second = (uint32_t)(((uint64_t)it->second * 3ull + rttMilliseconds) / 4ull);
+		}
+	}
+}
+
+static void SendPingsIfDue()
+{
+	const auto now = std::chrono::steady_clock::now();
+
+	if (g_LastPingSendTime.time_since_epoch().count() != 0 && (now - g_LastPingSendTime) < PING_INTERVAL)
+	{
+		return;
+	}
+
+	g_LastPingSendTime = now;
+
+	// RegisterPlayer() also records the local player, who must never be pinged.
+	std::string localUserID;
+	ProductUserIdToString(g_EOSUserID, localUserID);
+
+	std::vector<std::pair<std::string, uint32_t>> peers;
+	{
+		std::lock_guard<std::mutex> userMapLock(g_UserMapMutex);
+		peers.assign(g_UserMap.begin(), g_UserMap.end());
+	}
+
+	PingPayload payload = {};
+	payload.Magic = PING_PAYLOAD_MAGIC;
+	payload.SentMicroseconds = NowMicroseconds();
+
+	for (const auto& peer : peers)
+	{
+		if (!localUserID.empty() && peer.first == localUserID)
+		{
+			continue;
+		}
+
+		SendPacket(peer.first.c_str(), peer.second, &payload, (int)sizeof(payload),
+			ENetworkChannels::Ping, EPacketReliability::PACKET_RELIABILITY_UNRELIABLE_UNORDERED);
+	}
 }
 
 void HookupEvents()
@@ -671,183 +1618,301 @@ void HookupEvents()
 		return;
 	}
 
-	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
-	if (acHandle == nullptr)
-	{
-		PluginLog("[EAC] AC HANDLE NULL - Cannot hook events");
-		return;
-	}
+	EOS_HP2P P2PHandle = GetP2PHandle();
+
+	// cleanup networking notifications
+	RemoveP2PNotifications(P2PHandle);
+
 
 	// Clean up any existing notification IDs before registering new ones (prevents memory leak on re-hook)
-	if (g_NotifyClientIntegrityViolatedId != 0)
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
+	if (acHandle != nullptr)
 	{
-		EOS_AntiCheatClient_RemoveNotifyClientIntegrityViolated(acHandle, g_NotifyClientIntegrityViolatedId);
-		g_NotifyClientIntegrityViolatedId = 0;
-	}
-	if (g_NotifyMessageToPeerId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyMessageToPeer(acHandle, g_NotifyMessageToPeerId);
-		g_NotifyMessageToPeerId = 0;
-	}
-	if (g_NotifyPeerAuthStatusChangedId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyPeerAuthStatusChanged(acHandle, g_NotifyPeerAuthStatusChangedId);
-		g_NotifyPeerAuthStatusChangedId = 0;
-	}
-	if (g_NotifyPeerActionRequiredId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyPeerActionRequired(acHandle, g_NotifyPeerActionRequiredId);
-		g_NotifyPeerActionRequiredId = 0;
+		if (g_NotifyClientIntegrityViolatedId != 0)
+		{
+			EOS_AntiCheatClient_RemoveNotifyClientIntegrityViolated(acHandle, g_NotifyClientIntegrityViolatedId);
+			g_NotifyClientIntegrityViolatedId = 0;
+		}
+		if (g_NotifyMessageToPeerId != 0)
+		{
+			EOS_AntiCheatClient_RemoveNotifyMessageToPeer(acHandle, g_NotifyMessageToPeerId);
+			g_NotifyMessageToPeerId = 0;
+		}
+		if (g_NotifyPeerAuthStatusChangedId != 0)
+		{
+			EOS_AntiCheatClient_RemoveNotifyPeerAuthStatusChanged(acHandle, g_NotifyPeerAuthStatusChangedId);
+			g_NotifyPeerAuthStatusChangedId = 0;
+		}
+		if (g_NotifyPeerActionRequiredId != 0)
+		{
+			EOS_AntiCheatClient_RemoveNotifyPeerActionRequired(acHandle, g_NotifyPeerActionRequiredId);
+			g_NotifyPeerActionRequiredId = 0;
+		}
 	}
 
 	g_bEventsHooked = true;
 
-	EOS_AntiCheatClient_AddNotifyClientIntegrityViolatedOptions opts = {};
-	opts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYCLIENTINTEGRITYVIOLATED_API_LATEST;
-	g_NotifyClientIntegrityViolatedId = EOS_AntiCheatClient_AddNotifyClientIntegrityViolated(acHandle, &opts, nullptr, [](const EOS_AntiCheatClient_OnClientIntegrityViolatedCallbackInfo* Data)
-		{
-			if (Data == nullptr)
+	if (acHandle == nullptr)
+	{
+		PluginLog("[EAC] AC HANDLE NULL - Cannot hook events");
+	}
+	else
+	{
+		EOS_AntiCheatClient_AddNotifyClientIntegrityViolatedOptions opts = {};
+		opts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYCLIENTINTEGRITYVIOLATED_API_LATEST;
+		g_NotifyClientIntegrityViolatedId = EOS_AntiCheatClient_AddNotifyClientIntegrityViolated(acHandle, &opts, nullptr, [](const EOS_AntiCheatClient_OnClientIntegrityViolatedCallbackInfo* Data)
 			{
-				return;
-			}
-
-			const char* violationMsg = Data->ViolationMessage ? Data->ViolationMessage : "(null)";
-			PluginLog("[EAC] AC VIOLATION: %s (%d)", violationMsg, Data->ViolationType);
-
-			ACIntegrityViolationCallbackFunc callback = nullptr;
-			{
-				std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-				callback = g_fnAnticheatIntegrityViolationOccurredCallback;
-			}
-			// Lock released before calling callback
-			
-			if (callback != nullptr)
-			{
-				callback(violationMsg, (int)Data->ViolationType);
-			}
-		});
-
-	EOS_AntiCheatClient_AddNotifyMessageToPeerOptions AddNotifyMessageToPeerOpts = {};
-	AddNotifyMessageToPeerOpts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYMESSAGETOPEER_API_LATEST;
-	g_NotifyMessageToPeerId = EOS_AntiCheatClient_AddNotifyMessageToPeer(acHandle, &AddNotifyMessageToPeerOpts, nullptr, [](const EOS_AntiCheatCommon_OnMessageToClientCallbackInfo* Data)
-		{
-			if (Data == nullptr)
-			{
-				return;
-			}
-
-			uint32_t targetUserID = (uint32_t)Data->ClientHandle;
-			EOS_HAntiCheatClient acHandle = nullptr;
-			SendMessageViaTransportFunc sendMessageCallback = nullptr;
-			uint32_t localUserID = 0;
-			
-			{
-				std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-
-				acHandle = GetAntiCheatHandle();
-				
-				if (acHandle == nullptr)
+				if (Data == nullptr)
 				{
 					return;
 				}
 
-				// NOTE: A null ClientHandle is EOS_ANTICHEATCLIENT_PEER_SELF, which
-				// is a valid destination - only the payload may not be null.
-				if (Data->MessageData == nullptr || Data->MessageDataSizeBytes == 0)
+				const char* violationMsg = Data->ViolationMessage ? Data->ViolationMessage : "(null)";
+				PluginLog("[EAC] AC VIOLATION: %s (%d)", violationMsg, Data->ViolationType);
+
+				ACIntegrityViolationCallbackFunc callback = nullptr;
+				{
+					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+					callback = g_fnAnticheatIntegrityViolationOccurredCallback;
+				}
+				// Lock released before calling callback
+
+				if (callback != nullptr)
+				{
+					callback(violationMsg, (int)Data->ViolationType);
+				}
+			});
+
+		EOS_AntiCheatClient_AddNotifyMessageToPeerOptions AddNotifyMessageToPeerOpts = {};
+		AddNotifyMessageToPeerOpts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYMESSAGETOPEER_API_LATEST;
+		g_NotifyMessageToPeerId = EOS_AntiCheatClient_AddNotifyMessageToPeer(acHandle, &AddNotifyMessageToPeerOpts, nullptr, [](const EOS_AntiCheatCommon_OnMessageToClientCallbackInfo* Data)
+			{
+				if (Data == nullptr)
 				{
 					return;
 				}
 
-				sendMessageCallback = g_fnSendMessageViaTransport;
-				localUserID = g_goUserID;
-			}
-			// Lock released before processing
-			
-			// was it ourselves? just process immediately.
-			// localUserID is only meaningful once the local player has been
-			// registered; until then 0 means "unknown", not "peer 0".
-			const bool bIsSelf = (Data->ClientHandle == EOS_ANTICHEATCLIENT_PEER_SELF)
-				|| (localUserID != 0 && targetUserID == localUserID);
+				uint32_t targetUserID = (uint32_t)Data->ClientHandle;
+				EOS_HAntiCheatClient acHandle = nullptr;
+				SendMessageViaTransportFunc sendMessageCallback = nullptr;
+				uint32_t localUserID = 0;
 
-			if (bIsSelf)
-			{
-				EOS_AntiCheatClient_ReceiveMessageFromPeerOptions receiveOpts = {};
-				receiveOpts.ApiVersion = EOS_ANTICHEATCLIENT_RECEIVEMESSAGEFROMPEER_API_LATEST;
-				receiveOpts.PeerHandle = Data->ClientHandle;
-				receiveOpts.Data = Data->MessageData;
-				receiveOpts.DataLengthBytes = Data->MessageDataSizeBytes;
-
-				EOS_EResult receiveRes = EOS_AntiCheatClient_ReceiveMessageFromPeer(acHandle, &receiveOpts);
-				if (receiveRes != EOS_EResult::EOS_Success)
 				{
-					PluginLog("[EAC][LOCAL] MIDDLEWARE ERROR, EOS_AntiCheatClient_ReceiveMessageFromPeer: %s!", EOS_EResult_ToString(receiveRes));
+					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+
+					acHandle = GetAntiCheatHandle();
+
+					if (acHandle == nullptr)
+					{
+						return;
+					}
+
+					// NOTE: A null ClientHandle is EOS_ANTICHEATCLIENT_PEER_SELF, which
+					// is a valid destination - only the payload may not be null.
+					if (Data->MessageData == nullptr || Data->MessageDataSizeBytes == 0)
+					{
+						return;
+					}
+
+					sendMessageCallback = g_fnSendMessageViaTransport;
+					localUserID = g_goUserID;
 				}
-				else
+				// Lock released before processing
+
+				// was it ourselves? just process immediately.
+				// localUserID is only meaningful once the local player has been
+				// registered; until then 0 means "unknown", not "peer 0".
+				const bool bIsSelf = (Data->ClientHandle == EOS_ANTICHEATCLIENT_PEER_SELF)
+					|| (localUserID != 0 && targetUserID == localUserID);
+
+				if (bIsSelf)
 				{
-					PluginLog("[EAC][LOCAL] AC SEND MESSAGE TO PEER: %u bytes (User %u)", Data->MessageDataSizeBytes, targetUserID);
+					EOS_AntiCheatClient_ReceiveMessageFromPeerOptions receiveOpts = {};
+					receiveOpts.ApiVersion = EOS_ANTICHEATCLIENT_RECEIVEMESSAGEFROMPEER_API_LATEST;
+					receiveOpts.PeerHandle = Data->ClientHandle;
+					receiveOpts.Data = Data->MessageData;
+					receiveOpts.DataLengthBytes = Data->MessageDataSizeBytes;
+
+					EOS_EResult receiveRes = EOS_AntiCheatClient_ReceiveMessageFromPeer(acHandle, &receiveOpts);
+					if (receiveRes != EOS_EResult::EOS_Success)
+					{
+						PluginLog("[EAC][LOCAL] MIDDLEWARE ERROR, EOS_AntiCheatClient_ReceiveMessageFromPeer: %s!", EOS_EResult_ToString(receiveRes));
+					}
+					else
+					{
+						PluginLog("[EAC][LOCAL] AC SEND MESSAGE TO PEER: %u bytes (User %u)", Data->MessageDataSizeBytes, targetUserID);
+					}
 				}
-			}
-			else // send via transport
-			{
-				PluginLog("[EAC][REMOTE] AC SEND MESSAGE TO PEER: %u bytes (User %u)", Data->MessageDataSizeBytes, targetUserID);
-				if (sendMessageCallback != nullptr)
+				else // send via transport
 				{
-					sendMessageCallback(targetUserID, Data->MessageData, Data->MessageDataSizeBytes);
+					PluginLog("[EAC][REMOTE] AC SEND MESSAGE TO PEER: %u bytes (User %u)", Data->MessageDataSizeBytes, targetUserID);
+					if (sendMessageCallback != nullptr)
+					{
+						sendMessageCallback(targetUserID, Data->MessageData, Data->MessageDataSizeBytes);
+					}
+					else
+					{
+						PluginLog("[EAC][REMOTE] ERROR: Send message callback is null!");
+					}
 				}
-				else
+			});
+
+		EOS_AntiCheatClient_AddNotifyPeerAuthStatusChangedOptions authChangedOpts = {};
+		authChangedOpts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYPEERAUTHSTATUSCHANGED_API_LATEST;
+		g_NotifyPeerAuthStatusChangedId = EOS_AntiCheatClient_AddNotifyPeerAuthStatusChanged(acHandle, &authChangedOpts, nullptr, [](const EOS_AntiCheatCommon_OnClientAuthStatusChangedCallbackInfo* Data)
+			{
+				if (Data == nullptr)
 				{
-					PluginLog("[EAC][REMOTE] ERROR: Send message callback is null!");
+					return;
 				}
-			}
-		});
 
-	EOS_AntiCheatClient_AddNotifyPeerAuthStatusChangedOptions authChangedOpts = {};
-	authChangedOpts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYPEERAUTHSTATUSCHANGED_API_LATEST;
-	g_NotifyPeerAuthStatusChangedId = EOS_AntiCheatClient_AddNotifyPeerAuthStatusChanged(acHandle, &authChangedOpts, nullptr, [](const EOS_AntiCheatCommon_OnClientAuthStatusChangedCallbackInfo* Data)
-		{
-			if (Data == nullptr)
-			{
-				return;
-			}
-
-			uint32_t userID = (uint32_t)Data->ClientHandle;
-			PluginLog("[EAC] AC PEER AUTH STATUS CHANGED: %d (User %u)", Data->ClientAuthStatus, userID);
-		});
-
-	EOS_AntiCheatClient_AddNotifyPeerActionRequiredOptions actionRequiredOpts = {};
-	actionRequiredOpts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYPEERACTIONREQUIRED_API_LATEST;
-	g_NotifyPeerActionRequiredId = EOS_AntiCheatClient_AddNotifyPeerActionRequired(acHandle, &actionRequiredOpts, nullptr, [](const EOS_AntiCheatCommon_OnClientActionRequiredCallbackInfo* Data)
-		{
-			if (Data == nullptr)
-			{
-				return;
-			}
-
-			const char* reasonStr = Data->ActionReasonDetailsString ? Data->ActionReasonDetailsString : "(null)";
-			PluginLog("[EAC] AC PEER ACTION REQUIRED: %s (%d - %d)", reasonStr, Data->ClientAction, Data->ActionReasonCode);
-
-			ACPlayerActionRequiredCallbackFunc callback = nullptr;
-			
-			{
-				std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-				callback = g_fnAnticheatActionCallback;
-			}
-			// Lock released before calling callback
-			
-			if (callback != nullptr)
-			{
 				uint32_t userID = (uint32_t)Data->ClientHandle;
-				if (Data->ClientHandle == EOS_ANTICHEATCLIENT_PEER_SELF)
+				PluginLog("[EAC] AC PEER AUTH STATUS CHANGED: %d (User %u)", Data->ClientAuthStatus, userID);
+			});
+
+		EOS_AntiCheatClient_AddNotifyPeerActionRequiredOptions actionRequiredOpts = {};
+		actionRequiredOpts.ApiVersion = EOS_ANTICHEATCLIENT_ADDNOTIFYPEERACTIONREQUIRED_API_LATEST;
+		g_NotifyPeerActionRequiredId = EOS_AntiCheatClient_AddNotifyPeerActionRequired(acHandle, &actionRequiredOpts, nullptr, [](const EOS_AntiCheatCommon_OnClientActionRequiredCallbackInfo* Data)
+			{
+				if (Data == nullptr)
 				{
-					PluginLog("[EAC] AC PEER ACTION REQUIRED: is self (%u)", userID);
+					return;
 				}
-				else
+
+				const char* reasonStr = Data->ActionReasonDetailsString ? Data->ActionReasonDetailsString : "(null)";
+				PluginLog("[EAC] AC PEER ACTION REQUIRED: %s (%d - %d)", reasonStr, Data->ClientAction, Data->ActionReasonCode);
+
+				ACPlayerActionRequiredCallbackFunc callback = nullptr;
+
 				{
-					PluginLog("[EAC] AC PEER ACTION REQUIRED: is remote (%u)", userID);
+					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+					callback = g_fnAnticheatActionCallback;
 				}
-				callback(userID, reasonStr, (int)(EAnticheatActionType)Data->ClientAction, (int)(EAnticheatActionReason)Data->ActionReasonCode);
+				// Lock released before calling callback
+
+				if (callback != nullptr)
+				{
+					uint32_t userID = (uint32_t)Data->ClientHandle;
+					if (Data->ClientHandle == EOS_ANTICHEATCLIENT_PEER_SELF)
+					{
+						PluginLog("[EAC] AC PEER ACTION REQUIRED: is self (%u)", userID);
+					}
+					else
+					{
+						PluginLog("[EAC] AC PEER ACTION REQUIRED: is remote (%u)", userID);
+					}
+					callback(userID, reasonStr, (int)(EAnticheatActionType)Data->ClientAction, (int)(EAnticheatActionReason)Data->ActionReasonCode);
+				}
+			});
+	}
+	
+
+
+	// hook up notifications for networking
+	if (P2PHandle == nullptr)
+	{
+		PluginLog("[EAC] P2P HANDLE NULL - Cannot hook connection state events");
+		return;
+	}
+
+	// Set the options for subscribing to connection request notifications.
+	EOS_P2P_AddNotifyPeerConnectionRequestOptions ConnectionRequestNotificationOptions = {};
+	ConnectionRequestNotificationOptions.ApiVersion = EOS_P2P_ADDNOTIFYPEERCONNECTIONREQUEST_API_LATEST;
+	ConnectionRequestNotificationOptions.LocalUserId = g_EOSUserID;
+	ConnectionRequestNotificationOptions.SocketId = &g_SocketId;
+	g_ConnectionRequestNotificationId = EOS_P2P_AddNotifyPeerConnectionRequest(P2PHandle, &ConnectionRequestNotificationOptions, nullptr,
+		[](const EOS_P2P_OnIncomingConnectionRequestInfo* Data)
+		{
+			if (Data == nullptr)
+			{
+				return;
 			}
+
+			std::string middlewareUserID;
+			if (!ProductUserIdToString(Data->RemoteUserId, middlewareUserID))
+			{
+				PluginLog("[EAC] Incoming connection request from an unresolvable product user ID - rejecting");
+				return;
+			}
+
+			// Only accept connections from players the game has registered for
+			// this session; anyone else who knows our product user ID must not
+			// be able to open a connection to us.
+			uint32_t goUserID = 0;
+			if (!TryGetGoUserID(middlewareUserID, goUserID))
+			{
+				// The game registers peers from a service message that can land
+				// after the peer has already started signalling. EOS never
+				// re-delivers a connection request, so park it and let
+				// RegisterPlayer() accept it once the peer is vouched for.
+				{
+					std::lock_guard<std::mutex> userMapLock(g_UserMapMutex);
+					g_PendingConnectionRequests.insert(middlewareUserID);
+				}
+
+				PluginLog("[EAC] Deferring connection request from not-yet-registered peer %s",
+					middlewareUserID.c_str());
+				return;
+			}
+
+			if (!AcceptP2PConnection("OnIncomingConnectionRequest", Data->RemoteUserId, middlewareUserID.c_str()))
+			{
+				return;
+			}
+
+			ReportConnectionState(Data->RemoteUserId, "Connecting to", EConnectionState::CONNECTING_DIRECT, EOS_ENetworkConnectionType::EOS_NCT_NoConnection);
 		});
+
+	// Set the options for subscribing to connection established notifications.
+	EOS_P2P_AddNotifyPeerConnectionEstablishedOptions ConnectionEstablishedNotificationOptions = {};
+	ConnectionEstablishedNotificationOptions.ApiVersion = EOS_P2P_ADDNOTIFYPEERCONNECTIONESTABLISHED_API_LATEST;
+	ConnectionEstablishedNotificationOptions.LocalUserId = g_EOSUserID;
+	ConnectionEstablishedNotificationOptions.SocketId = &g_SocketId;
+	g_ConnectionEstablishedNotificationId = EOS_P2P_AddNotifyPeerConnectionEstablished(P2PHandle, &ConnectionEstablishedNotificationOptions, nullptr,
+		[](const EOS_P2P_OnPeerConnectionEstablishedInfo* Data)
+		{
+			if (Data == nullptr)
+			{
+				return;
+			}
+
+			ReportConnectionState(Data->RemoteUserId, "Connected to", EConnectionState::CONNECTED_DIRECT, Data->NetworkType);
+		});
+
+	EOS_P2P_AddNotifyPeerConnectionInterruptedOptions ConnectionInterruptedNotificationOptions = {};
+	ConnectionInterruptedNotificationOptions.ApiVersion = EOS_P2P_ADDNOTIFYPEERCONNECTIONINTERRUPTED_API_LATEST;
+	ConnectionInterruptedNotificationOptions.LocalUserId = g_EOSUserID;
+	ConnectionInterruptedNotificationOptions.SocketId = &g_SocketId;
+	g_ConnectionInterruptedNotificationId = EOS_P2P_AddNotifyPeerConnectionInterrupted(P2PHandle, &ConnectionInterruptedNotificationOptions, nullptr,
+		[](const EOS_P2P_OnPeerConnectionInterruptedInfo* Data)
+		{
+			if (Data == nullptr)
+			{
+				return;
+			}
+
+			ReportConnectionState(Data->RemoteUserId, "Disconnected from", EConnectionState::CONNECTION_DISCONNECTED, EOS_ENetworkConnectionType::EOS_NCT_NoConnection);
+		});
+
+	// Set the options for subscribing to connection closed notifications.
+	EOS_P2P_AddNotifyPeerConnectionClosedOptions ConnectionClosedNotificationOptions = {};
+	ConnectionClosedNotificationOptions.ApiVersion = EOS_P2P_ADDNOTIFYPEERCONNECTIONCLOSED_API_LATEST;
+	ConnectionClosedNotificationOptions.LocalUserId = g_EOSUserID;
+	ConnectionClosedNotificationOptions.SocketId = &g_SocketId;
+	g_ConnectionClosedNotificationId = EOS_P2P_AddNotifyPeerConnectionClosed(P2PHandle, &ConnectionClosedNotificationOptions, nullptr,
+		[](const EOS_P2P_OnRemoteConnectionClosedInfo* Data)
+		{
+			if (Data == nullptr)
+			{
+				return;
+			}
+
+			ReportConnectionState(Data->RemoteUserId, "Remote Disconnection by", EConnectionState::NOT_CONNECTED, EOS_ENetworkConnectionType::EOS_NCT_NoConnection);
+		});
+
+	// NOTE: these are unsubscribed in EndSession() and in Shutdown() (before the
+	// platform that owns them is released) via RemoveP2PNotifications().
+	// end networking notifications
 }
 
 void BeginSession()
@@ -856,26 +1921,32 @@ void BeginSession()
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
 
-	if (acHandle == nullptr)
-	{
-		PluginLog("[EAC] AC HANDLE IS NULL");
-		return;
-	}
 
 	HookupEvents();
 
-	EOS_AntiCheatClient_BeginSessionOptions beginSessionOpts = {};
-	beginSessionOpts.ApiVersion = EOS_ANTICHEATCLIENT_BEGINSESSION_API_LATEST;
-	beginSessionOpts.LocalUserId = g_EOSUserID;
-	beginSessionOpts.Mode = EOS_EAntiCheatClientMode::EOS_ACCM_PeerToPeer;
-	EOS_EResult result = EOS_AntiCheatClient_BeginSession(acHandle, &beginSessionOpts);
-	if (result != EOS_EResult::EOS_Success)
+	// Refresh the NAT type for this session; the result is logged and shown in
+	// lobby chat so players can see why their connections may be relayed.
+	QueryLocalNATType();
+
+	if (acHandle == nullptr)
 	{
-		PluginLog("[EAC] MIDDLEWARE ERROR, BEGIN SESSION: %s!", EOS_EResult_ToString(result));
+		PluginLog("[EAC] AC HANDLE IS NULL");
 	}
 	else
 	{
-		PluginLog("[EAC] BEGIN SESSION SUCCEEDED");
+		EOS_AntiCheatClient_BeginSessionOptions beginSessionOpts = {};
+		beginSessionOpts.ApiVersion = EOS_ANTICHEATCLIENT_BEGINSESSION_API_LATEST;
+		beginSessionOpts.LocalUserId = g_EOSUserID;
+		beginSessionOpts.Mode = EOS_EAntiCheatClientMode::EOS_ACCM_PeerToPeer;
+		EOS_EResult result = EOS_AntiCheatClient_BeginSession(acHandle, &beginSessionOpts);
+		if (result != EOS_EResult::EOS_Success)
+		{
+			PluginLog("[EAC] MIDDLEWARE ERROR, BEGIN SESSION: %s!", EOS_EResult_ToString(result));
+		}
+		else
+		{
+			PluginLog("[EAC] BEGIN SESSION SUCCEEDED");
+		}
 	}
 }
 
@@ -889,6 +1960,18 @@ bool DeregisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
+
+	std::string strUserKey(szMiddlewareUserID);
+	{
+		std::lock_guard<std::mutex> userMapLock(g_UserMapMutex);
+		g_UserMap.erase(strUserKey);
+		g_PendingConnectionRequests.erase(strUserKey);
+	}
+
+	{
+		std::lock_guard<std::mutex> latencyLock(g_LatencyMutex);
+		g_LatencyMs.erase(strUserKey);
+	}
 
 	if (acHandle == nullptr)
 	{
@@ -922,6 +2005,28 @@ bool RegisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
+
+	bool bHadPendingRequest = false;
+	{
+		std::lock_guard<std::mutex> userMapLock(g_UserMapMutex);
+		g_UserMap[std::string(szMiddlewareUserID)] = goUserID;
+		bHadPendingRequest = g_PendingConnectionRequests.erase(std::string(szMiddlewareUserID)) > 0;
+	}
+
+	// This peer tried to connect before the game vouched for it; complete the
+	// handshake now rather than waiting for a request EOS will never resend.
+	if (bHadPendingRequest)
+	{
+		PluginLog("[EAC] RegisterPlayer: accepting deferred connection request from %s", szMiddlewareUserID);
+
+		EOS_ProductUserId pendingPeer = EOS_ProductUserId_FromString(szMiddlewareUserID);
+
+		if (AcceptP2PConnection("RegisterPlayer", pendingPeer, szMiddlewareUserID))
+		{
+			ReportConnectionState(pendingPeer, "Connecting to", EConnectionState::CONNECTING_DIRECT,
+				EOS_ENetworkConnectionType::EOS_NCT_NoConnection);
+		}
+	}
 
 	if (acHandle == nullptr)
 	{
@@ -974,53 +2079,87 @@ void EndSession()
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
 
+	g_bEventsHooked = false;
+
+	// Tear down every P2P connection opened for this session.
+	//
+	// The game never calls DisconnectAll() itself, and EOS keeps connections
+	// alive until they are explicitly closed. A connection that survives into the
+	// next session is fatal: the connection notifications are edge-triggered, so
+	// the next match raises no connection request or established event and the
+	// game never observes the peer connecting.
+	DisconnectAll();
+
+	// Latency samples belong to the session that is ending; keeping them would
+	// report stale round trip times for the first seconds of the next match.
+	{
+		std::lock_guard<std::mutex> latencyLock(g_LatencyMutex);
+		g_LatencyMs.clear();
+	}
+
+	// Deferred connection requests are scoped to the session that raised them.
+	{
+		std::lock_guard<std::mutex> userMapLock(g_UserMapMutex);
+		g_PendingConnectionRequests.clear();
+	}
+
+	// Cached connection types describe connections we just closed.
+	{
+		std::lock_guard<std::mutex> connectionTypeLock(g_ConnectionTypeMutex);
+		g_ConnectionType.clear();
+	}
+
+	g_LastPingSendTime = std::chrono::steady_clock::time_point{};
+
+	// remove networking events
+	RemoveP2PNotifications(GetP2PHandle());
+
+	// Remove all registered notification callbacks before ending the session
 	if (acHandle == nullptr)
 	{
 		PluginLog("[EAC] AC HANDLE NULL 1");
-		return;
-	}
-
-	g_bEventsHooked = false;
-
-	// Remove all registered notification callbacks before ending the session
-	if (g_NotifyClientIntegrityViolatedId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyClientIntegrityViolated(acHandle, g_NotifyClientIntegrityViolatedId);
-		g_NotifyClientIntegrityViolatedId = 0;
-		PluginLog("[EAC] Removed ClientIntegrityViolated callback");
-	}
-
-	if (g_NotifyMessageToPeerId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyMessageToPeer(acHandle, g_NotifyMessageToPeerId);
-		g_NotifyMessageToPeerId = 0;
-		PluginLog("[EAC] Removed MessageToPeer callback");
-	}
-
-	if (g_NotifyPeerAuthStatusChangedId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyPeerAuthStatusChanged(acHandle, g_NotifyPeerAuthStatusChangedId);
-		g_NotifyPeerAuthStatusChangedId = 0;
-		PluginLog("[EAC] Removed PeerAuthStatusChanged callback");
-	}
-
-	if (g_NotifyPeerActionRequiredId != 0)
-	{
-		EOS_AntiCheatClient_RemoveNotifyPeerActionRequired(acHandle, g_NotifyPeerActionRequiredId);
-		g_NotifyPeerActionRequiredId = 0;
-		PluginLog("[EAC] Removed PeerActionRequired callback");
-	}
-
-	EOS_AntiCheatClient_EndSessionOptions endSessionOpts = {};
-	endSessionOpts.ApiVersion = EOS_ANTICHEATCLIENT_ENDSESSION_API_LATEST;
-	EOS_EResult result = EOS_AntiCheatClient_EndSession(acHandle, &endSessionOpts);
-	if (result != EOS_EResult::EOS_Success)
-	{
-		PluginLog("[EAC] MIDDLEWARE ERROR, END SESSION: %s!", EOS_EResult_ToString(result));
 	}
 	else
 	{
-		PluginLog("[EAC] End session succeeded: %s!", EOS_EResult_ToString(result));
+		if (g_NotifyClientIntegrityViolatedId != 0)
+		{
+			EOS_AntiCheatClient_RemoveNotifyClientIntegrityViolated(acHandle, g_NotifyClientIntegrityViolatedId);
+			g_NotifyClientIntegrityViolatedId = 0;
+			PluginLog("[EAC] Removed ClientIntegrityViolated callback");
+		}
+
+		if (g_NotifyMessageToPeerId != 0)
+		{
+			EOS_AntiCheatClient_RemoveNotifyMessageToPeer(acHandle, g_NotifyMessageToPeerId);
+			g_NotifyMessageToPeerId = 0;
+			PluginLog("[EAC] Removed MessageToPeer callback");
+		}
+
+		if (g_NotifyPeerAuthStatusChangedId != 0)
+		{
+			EOS_AntiCheatClient_RemoveNotifyPeerAuthStatusChanged(acHandle, g_NotifyPeerAuthStatusChangedId);
+			g_NotifyPeerAuthStatusChangedId = 0;
+			PluginLog("[EAC] Removed PeerAuthStatusChanged callback");
+		}
+
+		if (g_NotifyPeerActionRequiredId != 0)
+		{
+			EOS_AntiCheatClient_RemoveNotifyPeerActionRequired(acHandle, g_NotifyPeerActionRequiredId);
+			g_NotifyPeerActionRequiredId = 0;
+			PluginLog("[EAC] Removed PeerActionRequired callback");
+		}
+
+		EOS_AntiCheatClient_EndSessionOptions endSessionOpts = {};
+		endSessionOpts.ApiVersion = EOS_ANTICHEATCLIENT_ENDSESSION_API_LATEST;
+		EOS_EResult result = EOS_AntiCheatClient_EndSession(acHandle, &endSessionOpts);
+		if (result != EOS_EResult::EOS_Success)
+		{
+			PluginLog("[EAC] MIDDLEWARE ERROR, END SESSION: %s!", EOS_EResult_ToString(result));
+		}
+		else
+		{
+			PluginLog("[EAC] End session succeeded: %s!", EOS_EResult_ToString(result));
+		}
 	}
 }
 
