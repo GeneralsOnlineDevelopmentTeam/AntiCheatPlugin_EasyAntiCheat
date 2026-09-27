@@ -130,6 +130,10 @@ extern std::recursive_mutex g_StateMutex;
 // Callback registration
 PLUGIN_API void SetLoggingFunction(LoggingFunc cb);
 PLUGIN_API void SetLobbyChatOutputFunction(LoggingFunc cb);
+// Optional. Sets the display name reported with EOS metrics player sessions;
+// when unset the product user ID is used instead.
+// TODO_EOS: call this from game client
+PLUGIN_API void SetPlayerDisplayName(const char* displayName);
 PLUGIN_API void SetACActionRequiredCallback(ACPlayerActionRequiredCallbackFunc cb);
 PLUGIN_API void SetACIntegrityViolationOccurredCallback(ACIntegrityViolationCallbackFunc cb);
 PLUGIN_API void SetSendMessageViaTransportCallback(SendMessageViaTransportFunc cb);

@@ -1,6 +1,7 @@
 #include "plugin_eac.h"
 #include <unordered_map>
 #include <unordered_set>
+#include "EOS/Include/eos_metrics.h"
 #include "EOS/Include/eos_p2p_types.h"
 
 // ------------------------------------------------------------
@@ -31,6 +32,11 @@ EOS_NotificationId g_NotifyClientIntegrityViolatedId = 0;
 EOS_NotificationId g_NotifyMessageToPeerId = 0;
 EOS_NotificationId g_NotifyPeerAuthStatusChangedId = 0;
 EOS_NotificationId g_NotifyPeerActionRequiredId = 0;
+
+// The P2P connection notifications are scoped to the login, not to a session:
+// they stay registered from login until Shutdown() so the plugin is never deaf
+// to an incoming connection request while the player is between lobbies.
+static bool g_bP2PEventsHooked = false;
 
 typedef void (*LoginCallback)(bool bSuccess);
 LoginCallback g_LoginCallback = nullptr;
@@ -197,6 +203,18 @@ static EOS_HP2P GetP2PHandle()
 	}
 
 	return EOS_Platform_GetP2PInterface(g_EOSPlatformHandle);
+}
+
+// Returns the metrics interface, or nullptr if the platform has not been
+// initialised. Must be called with g_StateMutex held.
+static EOS_HMetrics GetMetricsHandle()
+{
+	if (g_EOSPlatformHandle == nullptr)
+	{
+		return nullptr;
+	}
+
+	return EOS_Platform_GetMetricsInterface(g_EOSPlatformHandle);
 }
 
 // EOS_ProductUserId_ToString() requires a buffer of EOS_PRODUCTUSERID_MAX_LENGTH + 1
@@ -403,6 +421,122 @@ static void QueryLocalNATType()
 				LobbyChatLog("[NAT] A strict NAT can cause connection problems. Enabling UPnP or forwarding ports on your router will help.");
 			}
 		});
+}
+
+// ------------------------------------------------------------
+// EOS metrics player sessions
+//
+// A metrics player session brackets the time the player spends in a match and
+// is what populates the Played Sessions view in the EOS developer portal.
+// ------------------------------------------------------------
+
+// Optional display name reported to the metrics backend. The host can supply
+// one via SetPlayerDisplayName(); otherwise the product user ID is used.
+static std::string g_strMetricsDisplayName;
+
+// Tracks whether a metrics session is open, so EndPlayerSession is only ever
+// called for one that was actually started and BeginPlayerSession is never
+// issued twice.
+static bool g_bMetricsSessionActive = false;
+
+void SetPlayerDisplayName(const char* displayName)
+{
+	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+	g_strMetricsDisplayName = (displayName != nullptr) ? displayName : "";
+}
+
+// Must be called with g_StateMutex held.
+static void BeginMetricsPlayerSession()
+{
+	if (g_bMetricsSessionActive)
+	{
+		return;
+	}
+
+	EOS_HMetrics metricsHandle = GetMetricsHandle();
+
+	if (metricsHandle == nullptr)
+	{
+		PluginLog("[EAC] Metrics: interface unavailable, cannot begin player session");
+		return;
+	}
+
+	std::string localUserID;
+	if (!ProductUserIdToString(g_EOSUserID, localUserID))
+	{
+		PluginLog("[EAC] Metrics: no local product user ID, cannot begin player session");
+		return;
+	}
+
+	// The metrics backend wants something human-readable; fall back to the
+	// product user ID so sessions are still attributable without a name.
+	const std::string& displayName = g_strMetricsDisplayName.empty() ? localUserID : g_strMetricsDisplayName;
+
+	EOS_Metrics_BeginPlayerSessionOptions opts = {};
+	opts.ApiVersion = EOS_METRICS_BEGINPLAYERSESSION_API_LATEST;
+	opts.AccountIdType = EOS_EMetricsAccountIdType::EOS_MAIT_External;
+	opts.AccountId.External = localUserID.c_str();
+	opts.DisplayName = displayName.c_str();
+	opts.ControllerType = EOS_EUserControllerType::EOS_UCT_MouseKeyboard;
+
+	// Peer to peer, so there is no game server address to report.
+	opts.ServerIp = nullptr;
+	opts.GameSessionId = nullptr;
+
+	EOS_EResult result = EOS_Metrics_BeginPlayerSession(metricsHandle, &opts);
+
+	if (result != EOS_EResult::EOS_Success)
+	{
+		PluginLog("[EAC] Metrics: BeginPlayerSession failed: %s", EOS_EResult_ToString(result));
+		return;
+	}
+
+	g_bMetricsSessionActive = true;
+	PluginLog("[EAC] Metrics: began player session for %s", displayName.c_str());
+}
+
+// Must be called with g_StateMutex held.
+static void EndMetricsPlayerSession()
+{
+	if (!g_bMetricsSessionActive)
+	{
+		return;
+	}
+
+	// Cleared up front: a failed end must not leave the flag set, or the next
+	// BeginPlayerSession would be skipped and every later session lost.
+	g_bMetricsSessionActive = false;
+
+	EOS_HMetrics metricsHandle = GetMetricsHandle();
+
+	if (metricsHandle == nullptr)
+	{
+		PluginLog("[EAC] Metrics: interface unavailable, cannot end player session");
+		return;
+	}
+
+	std::string localUserID;
+	if (!ProductUserIdToString(g_EOSUserID, localUserID))
+	{
+		PluginLog("[EAC] Metrics: no local product user ID, cannot end player session");
+		return;
+	}
+
+	EOS_Metrics_EndPlayerSessionOptions opts = {};
+	opts.ApiVersion = EOS_METRICS_ENDPLAYERSESSION_API_LATEST;
+	opts.AccountIdType = EOS_EMetricsAccountIdType::EOS_MAIT_External;
+	opts.AccountId.External = localUserID.c_str();
+
+	EOS_EResult result = EOS_Metrics_EndPlayerSession(metricsHandle, &opts);
+
+	if (result != EOS_EResult::EOS_Success)
+	{
+		PluginLog("[EAC] Metrics: EndPlayerSession failed: %s", EOS_EResult_ToString(result));
+	}
+	else
+	{
+		PluginLog("[EAC] Metrics: ended player session");
+	}
 }
 
 // Atomically detaches the pending login callback and invokes it without holding
@@ -686,6 +820,7 @@ static void RemoveP2PNotifications(EOS_HP2P p2pHandle)
 
 	// Always reset the IDs: they belong to the platform that is going away and
 	// must never be reused against a future one.
+	g_bP2PEventsHooked = false;
 	g_ConnectionRequestNotificationId = EOS_INVALID_NOTIFICATIONID;
 	g_ConnectionEstablishedNotificationId = EOS_INVALID_NOTIFICATIONID;
 	g_ConnectionInterruptedNotificationId = EOS_INVALID_NOTIFICATIONID;
@@ -954,6 +1089,10 @@ PLUGIN_API void Shutdown()
 		// Already shut down or never initialized; nothing to do.
 		return;
 	}
+
+	// Close any open metrics player session while the platform is still alive,
+	// otherwise the session is left dangling on the backend.
+	EndMetricsPlayerSession();
 
 	// P2P notifications belong to the platform we are about to release, so they
 	// must be unsubscribed first.
@@ -1890,9 +2029,6 @@ void HookupEvents()
 
 	EOS_HP2P P2PHandle = GetP2PHandle();
 
-	// cleanup networking notifications
-	RemoveP2PNotifications(P2PHandle);
-
 
 	// Clean up any existing notification IDs before registering new ones (prevents memory leak on re-hook)
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
@@ -2098,6 +2234,17 @@ void HookupEvents()
 		return;
 	}
 
+	// These survive across sessions, so only register them once. Re-registering
+	// per session would leave a window between EndSession() and BeginSession()
+	// where an incoming connection request is silently dropped - EOS never
+	// re-delivers it, so the peer would wait for a signalling retry.
+	if (g_bP2PEventsHooked)
+	{
+		return;
+	}
+
+	g_bP2PEventsHooked = true;
+
 	// Set the options for subscribing to connection request notifications.
 	EOS_P2P_AddNotifyPeerConnectionRequestOptions ConnectionRequestNotificationOptions = {};
 	ConnectionRequestNotificationOptions.ApiVersion = EOS_P2P_ADDNOTIFYPEERCONNECTIONREQUEST_API_LATEST;
@@ -2204,27 +2351,15 @@ void BeginSession()
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
 
-	// Purge anything left over from a previous session before the game starts
-	// signalling. EOS keeps P2P connections alive until they are explicitly
-	// closed, and the connection notifications are edge-triggered: a surviving
-	// connection raises no connection request or established event, so the game
-	// would never observe that peer connecting. This is safe here because no
-	// peer has been signalled yet for this session.
-	DisconnectAll();
-
-	{
-		std::lock_guard<std::mutex> latencyLock(g_LatencyMutex);
-		g_LatencyMs.clear();
-	}
-
-	{
-		std::lock_guard<std::mutex> connectionTypeLock(g_ConnectionTypeMutex);
-		g_ConnectionType.clear();
-	}
-
-	g_ACReassembly.clear();
+	// NOTE: deliberately no DisconnectAll() here. EndSession() already closed
+	// everything on the way out, and a peer that rejoined ahead of us may have
+	// already re-established its connection by now - tearing that down would
+	// force the game to wait for another signalling retry.
 
 	HookupEvents();
+
+	// Brackets the player's time in this match for the EOS metrics backend.
+	BeginMetricsPlayerSession();
 
 	// Refresh the NAT type for this session; the result is logged and shown in
 	// lobby chat so players can see why their connections may be relayed.
@@ -2385,6 +2520,8 @@ void EndSession()
 
 	g_bEventsHooked = false;
 
+	EndMetricsPlayerSession();
+
 	// Tear down every P2P connection opened for this session.
 	//
 	// The game never calls DisconnectAll() itself, and EOS keeps connections
@@ -2419,8 +2556,10 @@ void EndSession()
 
 	g_LastPingSendTime = std::chrono::steady_clock::time_point{};
 
-	// remove networking events
-	RemoveP2PNotifications(GetP2PHandle());
+	// NOTE: the P2P connection notifications are deliberately left registered.
+	// They are scoped to the login, not the session: unhooking them here would
+	// make the plugin deaf to a peer that reconnects while we are between
+	// lobbies, and EOS never re-delivers a connection request.
 
 	// Remove all registered notification callbacks before ending the session
 	if (acHandle == nullptr)
