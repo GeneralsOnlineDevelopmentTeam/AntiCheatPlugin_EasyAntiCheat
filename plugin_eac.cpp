@@ -245,7 +245,7 @@ static bool TryGetMiddlewareUserID(uint32_t goUserID, std::string& outMiddleware
 
 	for (const auto& entry : g_UserMap)
 	{
-		if (entry.second == goUserID)
+		if (entry.second == goUserID && !entry.first.empty())
 		{
 			outMiddlewareUserID = entry.first;
 			return true;
@@ -1617,6 +1617,12 @@ static void SendPingsIfDue()
 
 	for (const auto& peer : peers)
 	{
+		// A malformed registration must not turn into a ping every second.
+		if (peer.first.empty())
+		{
+			continue;
+		}
+
 		if (!localUserID.empty() && peer.first == localUserID)
 		{
 			continue;
