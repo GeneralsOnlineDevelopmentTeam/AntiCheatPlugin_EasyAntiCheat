@@ -87,7 +87,12 @@ enum class ENetworkChannels : uint8_t
 	Anticheat = 1,
 	Signalling = 2,
 	Ping,
-	Pong
+	Pong,
+	// Plugin-internal channel used when the plugin owns the transport and
+	// carries anti-cheat traffic itself. It deliberately does not reuse
+	// Anticheat: the game still polls that channel, and both sides draining the
+	// same queue would make packets vanish at random.
+	AnticheatSecure
 };
 
 // NOTE: must stay compatible with EPacketReliability in the game's PluginInterfaces.h

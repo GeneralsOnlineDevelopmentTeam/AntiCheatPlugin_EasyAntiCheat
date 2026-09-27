@@ -1124,30 +1124,11 @@ PLUGIN_API void StartSignalling(const char* middlewareUserID, uint64_t goUserID)
 		return;
 	}
 
-	// Drop any existing connection to this peer before signalling again.
-	//
-	// EOS keeps P2P connections alive across sessions, and the connection
-	// notifications are edge-triggered: if EOS still considers us connected from
-	// a previous match, re-signalling raises neither OnIncomingConnectionRequest
-	// on the remote nor OnPeerConnectionEstablished here, so the game waits
-	// forever for a peer it can never observe connecting. Closing first also
-	// avoids the half-open, single-direction state the game warns about in
-	// NetworkMesh::StartConnectionSignalling().
-	EOS_P2P_CloseConnectionOptions closeOptions = {};
-	closeOptions.ApiVersion = EOS_P2P_CLOSECONNECTION_API_LATEST;
-	closeOptions.LocalUserId = localUser;
-	closeOptions.RemoteUserId = targetPUID;
-	closeOptions.SocketId = &g_SocketId;
-
-	const EOS_EResult closeResult = EOS_P2P_CloseConnection(P2PHandle, &closeOptions);
-
-	// EOS_NotFound just means there was nothing to close, which is the normal
-	// first-connection case.
-	if (closeResult != EOS_EResult::EOS_Success && closeResult != EOS_EResult::EOS_NotFound)
-	{
-		PluginLog("[EAC] StartSignalling: could not drop stale connection to %s: %s",
-			middlewareUserID, EOS_EResult_ToString(closeResult));
-	}
+	// NOTE: do NOT close an existing connection to this peer here. Both sides
+	// signal each other, so closing on every signal means the second peer tears
+	// down the connection the first one just established and the game sees a
+	// disconnect. Connections left over from a previous session are purged once
+	// per session in BeginSession()/EndSession() instead.
 
 	// Set the options for sending the message.
 	EOS_P2P_SendPacketOptions SendPacketOptions = {};
@@ -1739,7 +1720,7 @@ static bool SendACMessageViaPluginTransport(uint32_t targetGoUserID, const void*
 		// Anti-cheat traffic must not be reordered or dropped, or the peer's
 		// session fails to validate and the player is kicked.
 		SendPacket(middlewareUserID.c_str(), targetGoUserID, packet, (int)(sizeof(header) + chunk),
-			ENetworkChannels::Anticheat, EPacketReliability::PACKET_RELIABILITY_RELIABLE_ORDERED);
+			ENetworkChannels::AnticheatSecure, EPacketReliability::PACKET_RELIABILITY_RELIABLE_ORDERED);
 	}
 
 	return true;
@@ -1786,7 +1767,7 @@ static void ProcessIncomingACMessages()
 		uint32_t bytesWritten = 0;
 		EOS_ProductUserId sender = nullptr;
 
-		if (!ReceivePacketCore("Anticheat", (uint8_t)ENetworkChannels::Anticheat, buffer, (uint32_t)sizeof(buffer), bytesWritten, sender))
+		if (!ReceivePacketCore("Anticheat", (uint8_t)ENetworkChannels::AnticheatSecure, buffer, (uint32_t)sizeof(buffer), bytesWritten, sender))
 		{
 			return;
 		}
@@ -2217,6 +2198,25 @@ void BeginSession()
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
 
+	// Purge anything left over from a previous session before the game starts
+	// signalling. EOS keeps P2P connections alive until they are explicitly
+	// closed, and the connection notifications are edge-triggered: a surviving
+	// connection raises no connection request or established event, so the game
+	// would never observe that peer connecting. This is safe here because no
+	// peer has been signalled yet for this session.
+	DisconnectAll();
+
+	{
+		std::lock_guard<std::mutex> latencyLock(g_LatencyMutex);
+		g_LatencyMs.clear();
+	}
+
+	{
+		std::lock_guard<std::mutex> connectionTypeLock(g_ConnectionTypeMutex);
+		g_ConnectionType.clear();
+	}
+
+	g_ACReassembly.clear();
 
 	HookupEvents();
 
@@ -2248,9 +2248,9 @@ void BeginSession()
 
 bool DeregisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 {
-	if (szMiddlewareUserID == nullptr)
+	if (szMiddlewareUserID == nullptr || szMiddlewareUserID[0] == '\0')
 	{
-		PluginLog("[EAC] DeregisterPlayer: Invalid middleware user ID (null)");
+		PluginLog("[EAC] DeregisterPlayer: Invalid middleware user ID (null/empty) for game user %u", goUserID);
 		return false;
 	}
 
@@ -2295,9 +2295,9 @@ bool DeregisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 
 bool RegisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 {
-	if (szMiddlewareUserID == nullptr)
+	if (szMiddlewareUserID == nullptr || szMiddlewareUserID[0] == '\0')
 	{
-		PluginLog("[EAC] RegisterPlayer: Invalid middleware user ID (null)");
+		PluginLog("[EAC] RegisterPlayer: Invalid middleware user ID (null/empty) for game user %u", goUserID);
 		return false;
 	}
 
