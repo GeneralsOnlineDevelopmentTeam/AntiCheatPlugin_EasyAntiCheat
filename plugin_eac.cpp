@@ -148,7 +148,8 @@ void PluginLog(const char* fmt, ...)
 
 // Writes a line to the game's lobby chat window, if the host has installed a
 // sink. Like PluginLog() this takes no lock so it is safe to call from EOS
-void LobbyChatLog(const char* fmt, ...)
+// worker threads.
+static void LobbyChatLog(const char* fmt, ...)
 {
 	if (fmt == nullptr)
 	{
@@ -233,6 +234,25 @@ static bool TryGetGoUserID(const std::string& middlewareUserID, uint32_t& outGoU
 
 	outGoUserID = it->second;
 	return true;
+}
+
+// Reverse of TryGetGoUserID(): finds the middleware user ID the game knows as
+// goUserID. Used by the anti-cheat transport, which is handed game user IDs by
+// the EOS anti-cheat interface but has to address peers by product user ID.
+static bool TryGetMiddlewareUserID(uint32_t goUserID, std::string& outMiddlewareUserID)
+{
+	std::lock_guard<std::mutex> lock(g_UserMapMutex);
+
+	for (const auto& entry : g_UserMap)
+	{
+		if (entry.second == goUserID)
+		{
+			outMiddlewareUserID = entry.first;
+			return true;
+		}
+	}
+
+	return false;
 }
 
 // Reports a peer's connection state change to the game. Shared by all four P2P
@@ -440,6 +460,17 @@ void ACMessageArrivedViaTransport(uint32_t sourceUserID, void* data, uint32_t da
 		return;
 	}
 
+	// Exactly one transport carries anti-cheat traffic. When the plugin owns the
+	// connection it drains its own anti-cheat channel in Tick(), so anything
+	// arriving through the game is either a duplicate or a leftover from the
+	// other transport and must not be replayed into the anti-cheat interface.
+	if (DoesACPluginProvideSecureGameTransport())
+	{
+		PluginLog("[AC][EAC][REMOTE] Ignoring %u bytes from user %u delivered via the game transport - the plugin owns the anti-cheat transport",
+			dataLen, sourceUserID);
+		return;
+	}
+
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
@@ -499,6 +530,7 @@ static std::chrono::steady_clock::time_point g_LastPingSendTime{};
 static void ProcessIncomingPings();
 static void ProcessIncomingPongs();
 static void SendPingsIfDue();
+static void ProcessIncomingACMessages();
 
 static uint64_t NowMicroseconds()
 {
@@ -518,6 +550,13 @@ void Tick()
 		ProcessIncomingPings();
 		ProcessIncomingPongs();
 		SendPingsIfDue();
+
+		// When the plugin owns the transport it also carries anti-cheat
+		// traffic, so drain that channel here rather than relying on the game.
+		if (DoesACPluginProvideSecureGameTransport())
+		{
+			ProcessIncomingACMessages();
+		}
 	}
 }
 
@@ -947,8 +986,6 @@ bool IsExternalProcessRunning()
 #if _DEBUG
 	return true;
 #else
-	// TODO_EOS: Restore once EAC is active
-	return true;
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	return GetAntiCheatHandle() != nullptr;
 #endif
@@ -1609,6 +1646,252 @@ static void SendPingsIfDue()
 	}
 }
 
+// ------------------------------------------------------------
+// Anti-cheat message transport
+//
+// When DoesACPluginProvideSecureGameTransport() is true the plugin owns the
+// network connection, so anti-cheat traffic is carried over the plugin's own
+// EOS P2P connection on ENetworkChannels::Anticheat instead of being handed
+// back to the game. EOS caps a packet at EOS_P2P_MAX_PACKET_SIZE but anti-cheat
+// messages can be larger, so they are fragmented here and reassembled on the
+// far side. The channel is reliable-ordered, which means fragments arrive in
+// the order they were sent and reassembly is a simple append.
+// ------------------------------------------------------------
+#pragma pack(push, 1)
+struct ACFragmentHeader
+{
+	uint32_t Magic;
+	uint32_t TotalBytes;
+	uint16_t FragmentIndex;
+	uint16_t FragmentCount;
+};
+#pragma pack(pop)
+
+// 'GOAC' - guards against a stray packet on the anti-cheat channel being fed
+// into the anti-cheat interface as a message.
+static constexpr uint32_t AC_FRAGMENT_MAGIC = 0x474F4143u;
+static constexpr uint32_t AC_FRAGMENT_PAYLOAD_MAX = (uint32_t)EOS_P2P_MAX_PACKET_SIZE - (uint32_t)sizeof(ACFragmentHeader);
+
+// An anti-cheat message larger than this is treated as corrupt rather than
+// being allowed to allocate arbitrary memory from a remote peer's say-so.
+static constexpr uint32_t AC_MESSAGE_MAX_BYTES = 1024u * 1024u;
+
+// Partially received anti-cheat messages, keyed by sender middleware user ID.
+// Only touched from Tick(), which holds g_StateMutex.
+struct ACReassemblyBuffer
+{
+	std::vector<uint8_t> Data;
+	uint32_t TotalBytes = 0;
+	uint16_t FragmentCount = 0;
+	uint16_t NextFragmentIndex = 0;
+};
+
+static std::unordered_map<std::string, ACReassemblyBuffer> g_ACReassembly;
+
+// Sends an anti-cheat message to a peer over the plugin's own P2P connection,
+// fragmenting it if it does not fit in a single EOS packet. Returns false if
+// the peer could not be addressed, so the caller can fall back to the game.
+static bool SendACMessageViaPluginTransport(uint32_t targetGoUserID, const void* data, uint32_t dataLen)
+{
+	if (data == nullptr || dataLen == 0)
+	{
+		return false;
+	}
+
+	if (dataLen > AC_MESSAGE_MAX_BYTES)
+	{
+		PluginLog("[EAC][REMOTE] AC message of %u bytes is implausibly large - dropping", dataLen);
+		return false;
+	}
+
+	std::string middlewareUserID;
+	if (!TryGetMiddlewareUserID(targetGoUserID, middlewareUserID))
+	{
+		PluginLog("[EAC][REMOTE] AC transport: no middleware user ID for game user %u", targetGoUserID);
+		return false;
+	}
+
+	const uint32_t fragmentCount = (dataLen + AC_FRAGMENT_PAYLOAD_MAX - 1) / AC_FRAGMENT_PAYLOAD_MAX;
+
+	if (fragmentCount > 0xFFFFu)
+	{
+		PluginLog("[EAC][REMOTE] AC message of %u bytes needs too many fragments - dropping", dataLen);
+		return false;
+	}
+
+	const uint8_t* source = static_cast<const uint8_t*>(data);
+	uint8_t packet[EOS_P2P_MAX_PACKET_SIZE] = {};
+
+	for (uint32_t fragmentIndex = 0; fragmentIndex < fragmentCount; ++fragmentIndex)
+	{
+		const uint32_t offset = fragmentIndex * AC_FRAGMENT_PAYLOAD_MAX;
+		const uint32_t chunk = (dataLen - offset) < AC_FRAGMENT_PAYLOAD_MAX ? (dataLen - offset) : AC_FRAGMENT_PAYLOAD_MAX;
+
+		ACFragmentHeader header = {};
+		header.Magic = AC_FRAGMENT_MAGIC;
+		header.TotalBytes = dataLen;
+		header.FragmentIndex = (uint16_t)fragmentIndex;
+		header.FragmentCount = (uint16_t)fragmentCount;
+
+		memcpy(packet, &header, sizeof(header));
+		memcpy(packet + sizeof(header), source + offset, chunk);
+
+		// Anti-cheat traffic must not be reordered or dropped, or the peer's
+		// session fails to validate and the player is kicked.
+		SendPacket(middlewareUserID.c_str(), targetGoUserID, packet, (int)(sizeof(header) + chunk),
+			ENetworkChannels::Anticheat, EPacketReliability::PACKET_RELIABILITY_RELIABLE_ORDERED);
+	}
+
+	return true;
+}
+
+// Hands a fully reassembled anti-cheat message to the EOS anti-cheat interface.
+static void DeliverACMessage(uint32_t senderGoUserID, const uint8_t* data, uint32_t dataLen)
+{
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
+
+	if (acHandle == nullptr)
+	{
+		PluginLog("[AC][EAC][REMOTE] AC transport: AC handle is null, dropping %u bytes", dataLen);
+		return;
+	}
+
+	EOS_AntiCheatClient_ReceiveMessageFromPeerOptions receiveOpts = {};
+	receiveOpts.ApiVersion = EOS_ANTICHEATCLIENT_RECEIVEMESSAGEFROMPEER_API_LATEST;
+	receiveOpts.PeerHandle = (void*)senderGoUserID;
+	receiveOpts.Data = data;
+	receiveOpts.DataLengthBytes = dataLen;
+
+	EOS_EResult receiveRes = EOS_AntiCheatClient_ReceiveMessageFromPeer(acHandle, &receiveOpts);
+
+	if (receiveRes != EOS_EResult::EOS_Success)
+	{
+		PluginLog("[AC][EAC][REMOTE] MIDDLEWARE ERROR, EOS_AntiCheatClient_ReceiveMessageFromPeer: %s!",
+			EOS_EResult_ToString(receiveRes));
+	}
+	else
+	{
+		PluginLog("[AC][EAC][REMOTE] AC RECEIVED MESSAGE FROM PEER: %u bytes (User %u)", dataLen, senderGoUserID);
+	}
+}
+
+// Drains the anti-cheat channel, reassembling fragmented messages and feeding
+// each completed one into the anti-cheat interface.
+static void ProcessIncomingACMessages()
+{
+	uint8_t buffer[EOS_P2P_MAX_PACKET_SIZE] = {};
+
+	for (;;)
+	{
+		uint32_t bytesWritten = 0;
+		EOS_ProductUserId sender = nullptr;
+
+		if (!ReceivePacketCore("Anticheat", (uint8_t)ENetworkChannels::Anticheat, buffer, (uint32_t)sizeof(buffer), bytesWritten, sender))
+		{
+			return;
+		}
+
+		if (bytesWritten < sizeof(ACFragmentHeader))
+		{
+			PluginLog("[EAC] AC transport: runt packet of %u bytes, ignoring", bytesWritten);
+			continue;
+		}
+
+		ACFragmentHeader header = {};
+		memcpy(&header, buffer, sizeof(header));
+
+		if (header.Magic != AC_FRAGMENT_MAGIC)
+		{
+			PluginLog("[EAC] AC transport: packet with bad magic, ignoring");
+			continue;
+		}
+
+		std::string senderID;
+		uint32_t senderGoUserID = 0;
+
+		// Only accept anti-cheat traffic from players the game registered.
+		if (!ProductUserIdToString(sender, senderID) || !TryGetGoUserID(senderID, senderGoUserID))
+		{
+			PluginLog("[EAC] AC transport: message from unregistered peer, ignoring");
+			continue;
+		}
+
+		const uint32_t payloadBytes = bytesWritten - (uint32_t)sizeof(header);
+
+		if (header.FragmentCount == 0 || header.FragmentIndex >= header.FragmentCount ||
+			header.TotalBytes == 0 || header.TotalBytes > AC_MESSAGE_MAX_BYTES)
+		{
+			PluginLog("[EAC] AC transport: malformed fragment header from %s, ignoring", senderID.c_str());
+			g_ACReassembly.erase(senderID);
+			continue;
+		}
+
+		// Single-fragment messages are the common case; deliver without
+		// touching the reassembly table.
+		if (header.FragmentCount == 1)
+		{
+			g_ACReassembly.erase(senderID);
+
+			if (payloadBytes != header.TotalBytes)
+			{
+				PluginLog("[EAC] AC transport: fragment from %s is %u bytes, expected %u - ignoring",
+					senderID.c_str(), payloadBytes, header.TotalBytes);
+				continue;
+			}
+
+			DeliverACMessage(senderGoUserID, buffer + sizeof(header), payloadBytes);
+			continue;
+		}
+
+		ACReassemblyBuffer& reassembly = g_ACReassembly[senderID];
+
+		if (header.FragmentIndex == 0)
+		{
+			reassembly = ACReassemblyBuffer();
+			reassembly.TotalBytes = header.TotalBytes;
+			reassembly.FragmentCount = header.FragmentCount;
+			reassembly.Data.reserve(header.TotalBytes);
+		}
+		else if (header.FragmentIndex != reassembly.NextFragmentIndex ||
+			header.TotalBytes != reassembly.TotalBytes ||
+			header.FragmentCount != reassembly.FragmentCount)
+		{
+			// The channel is reliable-ordered, so this means the peer restarted
+			// mid-message or is sending garbage. Drop the partial message
+			// rather than splicing unrelated bytes together.
+			PluginLog("[EAC] AC transport: out-of-sequence fragment %u from %s, dropping partial message",
+				(unsigned)header.FragmentIndex, senderID.c_str());
+			g_ACReassembly.erase(senderID);
+			continue;
+		}
+
+		if (reassembly.Data.size() + payloadBytes > reassembly.TotalBytes)
+		{
+			PluginLog("[EAC] AC transport: fragments from %s overflow the declared size, dropping", senderID.c_str());
+			g_ACReassembly.erase(senderID);
+			continue;
+		}
+
+		reassembly.Data.insert(reassembly.Data.end(), buffer + sizeof(header), buffer + bytesWritten);
+		reassembly.NextFragmentIndex = (uint16_t)(header.FragmentIndex + 1);
+
+		if (reassembly.NextFragmentIndex == reassembly.FragmentCount)
+		{
+			if (reassembly.Data.size() == reassembly.TotalBytes)
+			{
+				DeliverACMessage(senderGoUserID, reassembly.Data.data(), reassembly.TotalBytes);
+			}
+			else
+			{
+				PluginLog("[EAC] AC transport: reassembled %zu bytes from %s, expected %u - dropping",
+					reassembly.Data.size(), senderID.c_str(), reassembly.TotalBytes);
+			}
+
+			g_ACReassembly.erase(senderID);
+		}
+	}
+}
+
 void HookupEvents()
 {
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
@@ -1746,7 +2029,20 @@ void HookupEvents()
 				else // send via transport
 				{
 					PluginLog("[EAC][REMOTE] AC SEND MESSAGE TO PEER: %u bytes (User %u)", Data->MessageDataSizeBytes, targetUserID);
-					if (sendMessageCallback != nullptr)
+
+					// Exactly one transport carries anti-cheat traffic. When the
+					// plugin owns the connection it sends the message itself and
+					// the game never sees it; otherwise the game's transport is
+					// the only path. Never both, or the peer would receive every
+					// message twice and fail to validate.
+					if (DoesACPluginProvideSecureGameTransport())
+					{
+						if (!SendACMessageViaPluginTransport(targetUserID, Data->MessageData, Data->MessageDataSizeBytes))
+						{
+							PluginLog("[EAC][REMOTE] ERROR: AC transport could not send to user %u", targetUserID);
+						}
+					}
+					else if (sendMessageCallback != nullptr)
 					{
 						sendMessageCallback(targetUserID, Data->MessageData, Data->MessageDataSizeBytes);
 					}
@@ -1968,6 +2264,8 @@ bool DeregisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 		g_PendingConnectionRequests.erase(strUserKey);
 	}
 
+	g_ACReassembly.erase(strUserKey);
+
 	{
 		std::lock_guard<std::mutex> latencyLock(g_LatencyMutex);
 		g_LatencyMs.erase(strUserKey);
@@ -2108,6 +2406,10 @@ void EndSession()
 		std::lock_guard<std::mutex> connectionTypeLock(g_ConnectionTypeMutex);
 		g_ConnectionType.clear();
 	}
+
+	// Partially received anti-cheat messages cannot be completed once the
+	// connections carrying them are gone.
+	g_ACReassembly.clear();
 
 	g_LastPingSendTime = std::chrono::steady_clock::time_point{};
 
@@ -2386,6 +2688,10 @@ void Login(const char* szGameToken, LoginCallback cb)
 				PluginLog("[EAC] Login Complete: %s", szBuffer);
 
 				HookupEvents();
+
+				// Warm the NAT type up front so it is already known by the time
+				// the player reaches a lobby.
+				QueryLocalNATType();
 
 				FireLoginCallback(true);
 			}
