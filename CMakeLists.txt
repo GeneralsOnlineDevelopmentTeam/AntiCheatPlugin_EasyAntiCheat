@@ -20,3 +20,20 @@ set_target_properties(plugin_eac PROPERTIES
 if (WIN32)
     target_compile_definitions(plugin_eac PRIVATE -DPLUGIN_EXPORTS)
 endif()
+
+# EOS deployment credentials, supplied by the builder (see README).
+# Left undefined, plugin_eac.cpp falls back to placeholders and Initialize()
+# refuses to create a platform rather than failing obscurely at runtime.
+foreach(cred
+    EAC_EOS_PRODUCT_ID
+    EAC_EOS_SANDBOX_ID
+    EAC_EOS_DEPLOYMENT_ID
+    EAC_EOS_CLIENT_ID
+    EAC_EOS_CLIENT_SECRET)
+    set(${cred} "" CACHE STRING "EOS credential: ${cred}")
+    if (NOT ${cred} STREQUAL "")
+        target_compile_definitions(plugin_eac PRIVATE ${cred}="${${cred}}")
+    else()
+        message(WARNING "${cred} is not set - the built plugin will refuse to initialize.")
+    endif()
+endforeach()

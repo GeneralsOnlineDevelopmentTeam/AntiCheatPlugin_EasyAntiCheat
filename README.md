@@ -9,10 +9,23 @@ This can be obtained from Epic Games / Easy AntiCheat (https://onlineservices.ep
 
 # Configuration
 
-You will also need to configure an App/Product on the Epic Games Dev Portal and set the following variables in code:
+You will also need to configure an App/Product on the Epic Games Dev Portal and supply its
+credentials at build time. They are compile-time definitions, not source edits:
 
-PlatformOptions.ProductId = "TODO";
-PlatformOptions.SandboxId = "TODO";
-PlatformOptions.DeploymentId = "TODO";
-PlatformOptions.ClientCredentials.ClientId = "TODO";
-PlatformOptions.ClientCredentials.ClientSecret = "TODO";
+```
+cmake -A Win32 -B build ^
+  -DEAC_EOS_PRODUCT_ID=... ^
+  -DEAC_EOS_SANDBOX_ID=... ^
+  -DEAC_EOS_DEPLOYMENT_ID=... ^
+  -DEAC_EOS_CLIENT_ID=... ^
+  -DEAC_EOS_CLIENT_SECRET=...
+```
+
+If any of these are left unset, `Initialize()` logs a fatal error and returns `5`
+(`EInitializeResult_MissingCredentials`) instead of creating a platform that can never work.
+
+# Lifetime
+
+The host application **must** call the exported `Shutdown()` before unloading the DLL.
+Teardown is deliberately *not* performed in `DllMain(DLL_PROCESS_DETACH)`: releasing the EOS
+platform there runs under the Windows loader lock and deadlocks or faults.

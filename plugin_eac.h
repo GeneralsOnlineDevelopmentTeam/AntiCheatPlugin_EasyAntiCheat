@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 
 // Epic SDK
 #include "EOS/Include/eos_types.h"
@@ -56,13 +57,48 @@ typedef void (*ACIntegrityViolationCallbackFunc)(
 	int violationID
 	);
 
+// NOTE: must stay byte-for-byte compatible with EConnectionState in the game's
+// GameNetwork/GeneralsOnline/PluginInterfaces.h
+enum class EConnectionState : uint8_t
+{
+	NOT_CONNECTED = 0,
+	CONNECTING_DIRECT = 1,
+	FINDING_ROUTE = 2,
+	CONNECTED_DIRECT = 3,
+	CONNECTION_FAILED = 4,
+	CONNECTION_DISCONNECTED = 5
+};
+
+// NOTE: must stay compatible with ENetworkChannels in the game's PluginInterfaces.h
+enum class ENetworkChannels : uint8_t
+{
+	Game = 0,
+	Anticheat = 1,
+	Signalling = 2,
+	Ping,
+	Pong
+};
+
+// NOTE: must stay compatible with EPacketReliability in the game's PluginInterfaces.h
+enum class EPacketReliability : int32_t
+{
+	PACKET_RELIABILITY_UNRELIABLE_UNORDERED = 0,
+	PACKET_RELIABILITY_RELIABLE_UNORDERED = 1,
+	PACKET_RELIABILITY_RELIABLE_ORDERED = 2
+};
+
+// Signature is dictated by the game's FuncDefInitialize / OnConnectionStateChangedCallbackFunc
 typedef void (*ConnectionStateChangedCallbackFunc)(
-	uint32_t userId,
-	int connectionState
+	const char* middlewareUserID,
+	uint64_t goUserID,
+	EConnectionState connectionState
 	);
 
-extern LoggingFunc g_fnLoggingFunc;
-extern LoggingFunc g_fnLobbyChatOutput;
+// Logging sinks are atomic rather than mutex-protected: PluginLog() is invoked
+// from EOS SDK worker threads, and taking g_StateMutex there would invert the
+// lock order against threads that hold g_StateMutex while inside an EOS call.
+extern std::atomic<LoggingFunc> g_fnLoggingFunc;
+extern std::atomic<LoggingFunc> g_fnLobbyChatOutput;
 
 extern EOS_HPlatform g_EOSPlatformHandle;
 
@@ -70,17 +106,6 @@ typedef void (*LoginCallback)(bool bSuccess);
 
 // Thread synchronization for global state
 extern std::recursive_mutex g_StateMutex;
-
-// ------------------------------------------------------------
-// Enums (mirroring plugin.cpp)
-// ------------------------------------------------------------
-
-enum EPluginConnectionState
-{
-	EConnectionState_Connecting = 0,
-	EConnectionState_Connected = 1,
-	EConnectionState_ConnectionClosed = 2
-};
 
 // ------------------------------------------------------------
 // Exported API
@@ -104,7 +129,7 @@ PLUGIN_API int GetAnticheatIdentifier();
 
 PLUGIN_API bool GetMiddlewareAuthToken(char* buffer, size_t bufferSize);
 
-PLUGIN_API int Initialize();
+PLUGIN_API int Initialize(ConnectionStateChangedCallbackFunc connectionStateChangedCB);
 PLUGIN_API void Shutdown();
 PLUGIN_API void BeginSession();
 PLUGIN_API void EndSession();
@@ -116,6 +141,27 @@ PLUGIN_API void Login(const char* gameToken, LoginCallback cb);
 PLUGIN_API void RefreshToken(const char* gameToken, LoginCallback cb);
 
 // ------------------------------------------------------------
+// Transport API
+//
+// The game resolves every one of these at load time and unloads the plugin if
+// any is missing, so they must always be exported. This plugin does not provide
+// its own secure transport: DoesACPluginProvideSecureGameTransport() returns
+// false and the game keeps using its own mesh/WebSocket transport, which means
+// the remaining entry points are never driven by the game.
+// ------------------------------------------------------------
+PLUGIN_API bool DoesACPluginProvideSecureGameTransport();
+PLUGIN_API void StartSignalling(const char* middlewareUserID, uint64_t goUserID);
+PLUGIN_API void SendPacket(const char* middlewareUserID, uint64_t targetGoUserID, void* data, int numBytes, ENetworkChannels channel, EPacketReliability reliability);
+PLUGIN_API int GetNextRecvPacketSize(uint8_t channelToReceiveOn);
+PLUGIN_API bool RecvPacket(uint8_t** outData, uint8_t channelToReceiveOn);
+PLUGIN_API void FreePacket(void* packetData);
+
+PLUGIN_API int GetConnectionLatencyForUser(const char* middlewareUserID, uint32_t goUserID);
+
+PLUGIN_API void DisconnectPlayer(const char* middlewareUserID, uint64_t goUserID);
+PLUGIN_API void DisconnectAll();
+
+// ------------------------------------------------------------
 // Vars
 // ------------------------------------------------------------
 extern EOS_ProductUserId g_EOSUserID;
@@ -124,6 +170,7 @@ extern uint32_t g_goUserID;
 extern ACIntegrityViolationCallbackFunc g_fnAnticheatIntegrityViolationOccurredCallback;
 extern ACPlayerActionRequiredCallbackFunc g_fnAnticheatActionCallback;
 extern SendMessageViaTransportFunc g_fnSendMessageViaTransport;
+extern ConnectionStateChangedCallbackFunc g_fnConnectionStateChanged;
 extern bool g_bEventsHooked;
 
 // ------------------------------------------------------------

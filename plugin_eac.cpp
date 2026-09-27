@@ -3,8 +3,8 @@
 // ------------------------------------------------------------
 // Global definitions (declared extern in plugin_eac.h)
 // ------------------------------------------------------------
-LoggingFunc g_fnLoggingFunc = nullptr;
-LoggingFunc g_fnLobbyChatOutput = nullptr;
+std::atomic<LoggingFunc> g_fnLoggingFunc{ nullptr };
+std::atomic<LoggingFunc> g_fnLobbyChatOutput{ nullptr };
 EOS_HPlatform g_EOSPlatformHandle = nullptr;
 std::recursive_mutex g_StateMutex;
 
@@ -14,6 +14,7 @@ uint32_t g_goUserID = 0;
 ACIntegrityViolationCallbackFunc g_fnAnticheatIntegrityViolationOccurredCallback = nullptr;
 ACPlayerActionRequiredCallbackFunc g_fnAnticheatActionCallback = nullptr;
 SendMessageViaTransportFunc g_fnSendMessageViaTransport = nullptr;
+ConnectionStateChangedCallbackFunc g_fnConnectionStateChanged = nullptr;
 bool g_bEventsHooked = false;
 
 // Global notification IDs for callback cleanup
@@ -25,25 +26,64 @@ EOS_NotificationId g_NotifyPeerActionRequiredId = 0;
 typedef void (*LoginCallback)(bool bSuccess);
 LoginCallback g_LoginCallback = nullptr;
 
+// ------------------------------------------------------------
+// EOS deployment credentials
+//
+// These MUST be supplied by the builder, e.g.
+//   cmake -DEAC_EOS_PRODUCT_ID=... (see README)
+// or by defining them on the compiler command line. The "TODO" fallbacks exist
+// only so the file compiles standalone; Initialize() refuses to run with them.
+// ------------------------------------------------------------
+#ifndef EAC_EOS_PRODUCT_ID
+#define EAC_EOS_PRODUCT_ID "TODO"
+#endif
+#ifndef EAC_EOS_SANDBOX_ID
+#define EAC_EOS_SANDBOX_ID "TODO"
+#endif
+#ifndef EAC_EOS_DEPLOYMENT_ID
+#define EAC_EOS_DEPLOYMENT_ID "TODO"
+#endif
+#ifndef EAC_EOS_CLIENT_ID
+#define EAC_EOS_CLIENT_ID "TODO"
+#endif
+#ifndef EAC_EOS_CLIENT_SECRET
+#define EAC_EOS_CLIENT_SECRET "TODO"
+#endif
+
+// Return codes from Initialize()
+enum EInitializeResult
+{
+	EInitializeResult_Success = 0,
+	EInitializeResult_BadEnvironment = 1,
+	EInitializeResult_ContainerFailed = 2,
+	EInitializeResult_SDKInitFailed = 3,
+	EInitializeResult_PlatformCreateFailed = 4,
+	EInitializeResult_MissingCredentials = 5
+};
+
 // Forward declaration so DllMain can call Shutdown() defined later in this file.
 PLUGIN_API void Shutdown();
 
-BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD ul_reason_for_call, LPVOID /*lpReserved*/)
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/)
 {
 	switch (ul_reason_for_call)
 	{
 		case DLL_PROCESS_ATTACH:
 		{
+			::DisableThreadLibraryCalls(hModule);
 			break;
 		}
 
 		case DLL_PROCESS_DETACH:
 		{
-			// Fully tear down the EOS SDK so its internal threads and atexit
-			// handlers do not fire after the DLL has been unloaded, which would
-			// cause an EXCEPTION_ACCESS_VIOLATION_WRITE at address 0x0.
-			// Shutdown() is idempotent: it checks g_EOSPlatformHandle first.
-			Shutdown();
+			// NOTE: Do NOT tear down the EOS SDK here. EOS_Platform_Release() and
+			// EOS_Shutdown() join worker threads, unload dependent modules and
+			// re-enter user code - all of which deadlock or fault when performed
+			// under the Windows loader lock. Acquiring g_StateMutex here is unsafe
+			// for the same reason.
+			//
+			// The host application is responsible for calling the exported
+			// Shutdown() before unloading this module.
 			break;
 		}
 	}
@@ -58,33 +98,67 @@ void PluginLog(const char* fmt, ...)
 		return;
 	}
 
+	// This function is called from EOS SDK worker threads (via the EOS logging
+	// callback) as well as from game threads. It deliberately takes no lock: the
+	// sink is read atomically and invoked without holding g_StateMutex, so a
+	// thread inside an EOS call cannot deadlock against an EOS logging thread.
+	LoggingFunc sink = g_fnLoggingFunc.load(std::memory_order_acquire);
+	if (sink == nullptr)
+	{
+		return;
+	}
+
 	char buffer[8192];
 	va_list args;
 	va_start(args, fmt);
-	vsnprintf(buffer, 8192, fmt, args);
-	buffer[8192 - 1] = 0;
+	vsnprintf(buffer, sizeof(buffer), fmt, args);
+	buffer[sizeof(buffer) - 1] = 0;
 	va_end(args);
 
-	// Lock before accessing global callback to prevent data race
+	sink(buffer);
+}
+
+// Returns the anti-cheat client interface, or nullptr if the platform has not
+// been initialised. EOS_Platform_GetAntiCheatClientInterface() dereferences its
+// argument, so the platform handle must never be passed through as null.
+// Must be called with g_StateMutex held.
+static EOS_HAntiCheatClient GetAntiCheatHandle()
+{
+	if (g_EOSPlatformHandle == nullptr)
+	{
+		return nullptr;
+	}
+
+	return EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+}
+
+// Atomically detaches the pending login callback and invokes it without holding
+// g_StateMutex, so the host can safely re-enter the plugin and a stale callback
+// can never be fired twice.
+static void FireLoginCallback(bool bSuccess)
+{
+	LoginCallback localCallback = nullptr;
+
 	{
 		std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-		if (g_fnLoggingFunc != nullptr)
-		{
-			g_fnLoggingFunc(buffer);
-		}
+		localCallback = g_LoginCallback;
+		g_LoginCallback = nullptr;
+	}
+
+	if (localCallback != nullptr)
+	{
+		localCallback(bSuccess);
 	}
 }
 
 void SetLoggingFunction(LoggingFunc cb)
 {
-	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	g_fnLoggingFunc = cb;
+	g_fnLoggingFunc.store(cb, std::memory_order_release);
 }
 
 void SetLobbyChatOutputFunction(LoggingFunc cb)
 {
-	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	g_fnLobbyChatOutput = cb;
+	g_fnLobbyChatOutput.store(cb, std::memory_order_release);
 }
 
 void SetACActionRequiredCallback(ACPlayerActionRequiredCallbackFunc cb)
@@ -114,15 +188,9 @@ void ACMessageArrivedViaTransport(uint32_t sourceUserID, void* data, uint32_t da
 	}
 
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	
-	if (g_EOSPlatformHandle == nullptr)
-	{
-		PluginLog("[AC][EAC][REMOTE] ERROR: Platform handle is null");
-		return;
-	}
 
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
-	
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
+
 	if (acHandle == nullptr)
 	{
 		PluginLog("[AC][EAC][REMOTE] ERROR: AC handle is null");
@@ -145,15 +213,6 @@ void ACMessageArrivedViaTransport(uint32_t sourceUserID, void* data, uint32_t da
 		PluginLog("[AC][EAC][REMOTE] AC RECEIVED MESSAGE FROM PEER: %u bytes (User %u)", dataLen, sourceUserID);
 	}
 }
-
-enum class ENetworkChannels
-{
-	Game,
-	Anticheat,
-	Ping,
-	Pong,
-	InitialHolepunch
-};
 
 void Tick()
 {
@@ -186,8 +245,20 @@ bool GetMiddlewareAuthToken(char* buffer, size_t bufferSize)
 		PluginLog("[EAC] MIDDLEWARE ERROR: Platform not initialized!");
 		return false;
 	}
+
+	if (g_EOSUserID == nullptr)
+	{
+		PluginLog("[EAC] MIDDLEWARE ERROR: Not logged in!");
+		return false;
+	}
 	
 	EOS_HConnect ConnectHandle = EOS_Platform_GetConnectInterface(g_EOSPlatformHandle);
+
+	if (ConnectHandle == nullptr)
+	{
+		PluginLog("[EAC] MIDDLEWARE ERROR: Connect handle is null!");
+		return false;
+	}
 
 	EOS_Connect_IdToken* epicToken = nullptr;
 
@@ -208,41 +279,75 @@ bool GetMiddlewareAuthToken(char* buffer, size_t bufferSize)
 		return false;
 	}
 
+	// From here on the token is owned by us and must be released on every path.
+	bool bSuccess = false;
+
 	if (epicToken->JsonWebToken == nullptr)
 	{
 		PluginLog("[EAC] MIDDLEWARE ERROR: JsonWebToken is null!");
-		return false;
+	}
+	else
+	{
+		const char* msg = epicToken->JsonWebToken;
+		size_t len = strlen(msg) + 1;
+
+		// Validate token length doesn't exceed a reasonable size
+		if (len > 8192)
+		{
+			PluginLog("[EAC] MIDDLEWARE ERROR: Token too large!");
+		}
+		else if (bufferSize < len)
+		{
+			PluginLog("[EAC] MIDDLEWARE BAD SIZE!");
+		}
+		else
+		{
+			memcpy(buffer, msg, len);
+			bSuccess = true;
+		}
 	}
 
-	const char* msg = epicToken->JsonWebToken;
-	size_t len = strlen(msg) + 1;
-	
-	// Validate token length doesn't exceed a reasonable size
-	if (len > 8192)
-	{
-		PluginLog("[EAC] MIDDLEWARE ERROR: Token too large!");
-		return false;
-	}
-	
-	if (bufferSize < len)
-	{
-		PluginLog("[EAC] MIDDLEWARE BAD SIZE!");
-		return false;
-	}
+	EOS_Connect_IdToken_Release(epicToken);
 
-	memcpy(buffer, msg, len);
-	return true;
+	return bSuccess;
 }
 
-int Initialize()
+int Initialize(ConnectionStateChangedCallbackFunc connectionStateChangedCB)
 {
     std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-    
+
+    // The game hands this in on every Initialize() call, keep the latest one even
+    // if we early out below so a re-init can't leave a stale pointer behind.
+    g_fnConnectionStateChanged = connectionStateChangedCB;
+
     // Check if already initialized
     if (g_EOSPlatformHandle != nullptr)
     {
         PluginLog("[EAC] Already initialized - skipping re-initialization");
-        return 0;
+        return EInitializeResult_Success;
+    }
+
+    // Refuse to run with placeholder credentials: EOS_Platform_Create() would
+    // return a null handle and every subsequent call would fail obscurely.
+    {
+        const char* credentials[] =
+        {
+            EAC_EOS_PRODUCT_ID,
+            EAC_EOS_SANDBOX_ID,
+            EAC_EOS_DEPLOYMENT_ID,
+            EAC_EOS_CLIENT_ID,
+            EAC_EOS_CLIENT_SECRET
+        };
+
+        for (const char* credential : credentials)
+        {
+            if (credential == nullptr || credential[0] == '\0' || strcmp(credential, "TODO") == 0)
+            {
+                PluginLog("[EAC] FATAL ERROR: EOS deployment credentials have not been configured.");
+                PluginLog("[EAC] FATAL ERROR: Define EAC_EOS_PRODUCT_ID / EAC_EOS_SANDBOX_ID / EAC_EOS_DEPLOYMENT_ID / EAC_EOS_CLIENT_ID / EAC_EOS_CLIENT_SECRET at build time.");
+                return EInitializeResult_MissingCredentials;
+            }
+        }
     }
 
 	// Init EOS SDK
@@ -262,7 +367,6 @@ int Initialize()
 
     EOS_EResult InitResult = EOS_Initialize(&SDKOptions);
 
-    // TODO: Decrease logging once confirmed stable
     if (InitResult == EOS_EResult::EOS_Success)
     {
         // LOGGING
@@ -284,20 +388,17 @@ int Initialize()
         {
             PluginLog("[EAC] Logging Callback Set");
 #if _DEBUG
-            //EOS_Logging_SetLogLevel(EOS_ELogCategory::EOS_LC_ALL_CATEGORIES, EOS_ELogLevel::EOS_LOG_Info);
-			EOS_EResult SetLogLevelResult = EOS_Logging_SetLogLevel(EOS_ELogCategory::EOS_LC_ALL_CATEGORIES, EOS_ELogLevel::EOS_LOG_VeryVerbose);
-			if (SetLogLevelResult != EOS_EResult::EOS_Success)
-			{
-				PluginLog("[EAC] Set Logging Level Failed!");
-			}
+			const EOS_ELogLevel logLevel = EOS_ELogLevel::EOS_LOG_Verbose;
 #else
-            //EOS_Logging_SetLogLevel(EOS_ELogCategory::EOS_LC_ALL_CATEGORIES, EOS_ELogLevel::EOS_LOG_Error);
-			EOS_EResult SetLogLevelResult = EOS_Logging_SetLogLevel(EOS_ELogCategory::EOS_LC_ALL_CATEGORIES, EOS_ELogLevel::EOS_LOG_VeryVerbose);
+			// Shipping builds only surface errors - VeryVerbose floods the game
+			// log and costs measurable frame time.
+			const EOS_ELogLevel logLevel = EOS_ELogLevel::EOS_LOG_Error;
+#endif
+			EOS_EResult SetLogLevelResult = EOS_Logging_SetLogLevel(EOS_ELogCategory::EOS_LC_ALL_CATEGORIES, logLevel);
 			if (SetLogLevelResult != EOS_EResult::EOS_Success)
 			{
 				PluginLog("[EAC] Set Logging Level Failed!");
 			}
-#endif
         }
 		
         std::filesystem::path tempPath = std::filesystem::current_path();
@@ -314,16 +415,18 @@ int Initialize()
         PlatformOptions.Flags = EOS_PF_WINDOWS_ENABLE_OVERLAY_D3D9 | EOS_PF_WINDOWS_ENABLE_OVERLAY_D3D10;
         PlatformOptions.CacheDirectory = strCachePath.c_str();
 
-        PlatformOptions.ProductId = "TODO";
-        PlatformOptions.SandboxId = "TODO";
+        PlatformOptions.ProductId = EAC_EOS_PRODUCT_ID;
+        PlatformOptions.SandboxId = EAC_EOS_SANDBOX_ID;
         PlatformOptions.EncryptionKey = "1111111111111111111111111111111111111111111111111111111"; // NOTE: unused
-        PlatformOptions.DeploymentId = "TODO";
+        PlatformOptions.DeploymentId = EAC_EOS_DEPLOYMENT_ID;
 
-        PlatformOptions.ClientCredentials.ClientId = "TODO";
-        PlatformOptions.ClientCredentials.ClientSecret = "TODO";
+        PlatformOptions.ClientCredentials.ClientId = EAC_EOS_CLIENT_ID;
+        PlatformOptions.ClientCredentials.ClientSecret = EAC_EOS_CLIENT_SECRET;
 
-        double timeout = 5000.0;
-        PlatformOptions.TaskNetworkTimeoutSeconds = &timeout;
+        // Seconds, not milliseconds. Static so the pointer stays valid for the
+        // lifetime of the platform regardless of when the SDK reads it.
+        static double s_taskNetworkTimeoutSeconds = 5.0;
+        PlatformOptions.TaskNetworkTimeoutSeconds = &s_taskNetworkTimeoutSeconds;
 
         EOS_Platform_RTCOptions RtcOptions = {};
         RtcOptions.ApiVersion = EOS_PLATFORM_RTCOPTIONS_API_LATEST;
@@ -342,7 +445,8 @@ int Initialize()
         if (pos == std::string::npos)
         {
             PluginLog("FATAL ERROR: Failed to parse executable path");
-            return 1;
+            EOS_Shutdown();
+            return EInitializeResult_BadEnvironment;
         }
         
         std::string ExePath = std::string(buffer).substr(0, pos);
@@ -357,7 +461,8 @@ int Initialize()
             {
                 PluginLog("FATAL ERROR: Game installation path contains non-ASCII characters: %s", ExePath.c_str());
                 PluginLog("FATAL ERROR: Please move the game to a directory with only ASCII characters (A-Z, 0-9, etc.).");
-                return 1;
+                EOS_Shutdown();
+                return EInitializeResult_BadEnvironment;
             }
         }
 
@@ -374,7 +479,8 @@ int Initialize()
 		if (!fileStream.good())
 		{
 			PluginLog("FATAL ERROR: Failed to locate XAudio DLL");
-			return 1;
+			EOS_Shutdown();
+			return EInitializeResult_BadEnvironment;
 		}
 		else
 		{
@@ -409,24 +515,31 @@ int Initialize()
         if (Result != EOS_EResult::EOS_Success)
         {
             PluginLog("EOS_IntegratedPlatform_CreateIntegratedPlatformOptionsContainer returned an error");
-            return 2;
+            EOS_Shutdown();
+            return EInitializeResult_ContainerFailed;
         }
 
         g_EOSPlatformHandle = EOS_Platform_Create(&PlatformOptions);
-        
+
+        // The container is only read during EOS_Platform_Create; release it on
+        // both paths so it is not leaked for the lifetime of the process.
+        EOS_IntegratedPlatformOptionsContainer_Release(PlatformOptions.IntegratedPlatformOptionsContainerHandle);
+        PlatformOptions.IntegratedPlatformOptionsContainerHandle = nullptr;
+
         if (g_EOSPlatformHandle == nullptr)
         {
             PluginLog("FATAL ERROR: EOS_Platform_Create failed - returned null handle");
-            return 4;
+            EOS_Shutdown();
+            return EInitializeResult_PlatformCreateFailed;
         }
         // END PLATFORM OPTIONS
 
-        return 0;
+        return EInitializeResult_Success;
     }
     else
     {
         PluginLog("[EAC] INIT FAILED: %s", EOS_EResult_ToString(InitResult));
-        return 3;
+        return EInitializeResult_SDKInitFailed;
     }
 }
 
@@ -444,32 +557,109 @@ PLUGIN_API void Shutdown()
 
 	EOS_Shutdown();
 	
-	// Reset global state
+	// Reset EOS-owned state. The notification IDs belong to the released
+	// platform and must not be reused against a future one.
 	g_EOSUserID = nullptr;
 	g_goUserID = 0;
-	g_fnLoggingFunc = nullptr;
-	g_fnLobbyChatOutput = nullptr;
-	g_fnAnticheatIntegrityViolationOccurredCallback = nullptr;
-	g_fnAnticheatActionCallback = nullptr;
-	g_fnSendMessageViaTransport = nullptr;
 	g_LoginCallback = nullptr;
 	g_bEventsHooked = false;
+	g_NotifyClientIntegrityViolatedId = 0;
+	g_NotifyMessageToPeerId = 0;
+	g_NotifyPeerAuthStatusChangedId = 0;
+	g_NotifyPeerActionRequiredId = 0;
+
+	// NOTE: The host-supplied callbacks (logging, anti-cheat, transport) are
+	// deliberately preserved. They are owned by the host, outlive the EOS
+	// platform, and clearing them here would silently disable logging and all
+	// anti-cheat notifications after a shutdown/re-initialise cycle.
 }
 
 bool IsExternalProcessRunning()
 {
+#if _DEBUG
+	return true;
+#else
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	if (g_EOSPlatformHandle == nullptr)
-	{
-		return false;
-	}
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
-	return acHandle != nullptr;
+	return GetAntiCheatHandle() != nullptr;
+#endif
 }
 
 PLUGIN_API int GetAnticheatIdentifier()
 {
 	return 9481;
+}
+
+// ------------------------------------------------------------
+// Transport API
+//
+// This plugin runs anti-cheat only, it does not own a game transport. The game
+// still resolves all of these exports at load time and unloads the plugin if any
+// is missing, so they are exported as well-defined no-ops. Because
+// DoesACPluginProvideSecureGameTransport() reports false, the game routes both
+// game and anti-cheat traffic over its own mesh/WebSocket transport and never
+// calls the remaining functions.
+// ------------------------------------------------------------
+PLUGIN_API bool DoesACPluginProvideSecureGameTransport()
+{
+	return false;
+}
+
+PLUGIN_API void StartSignalling(const char* middlewareUserID, uint64_t goUserID)
+{
+	(void)middlewareUserID;
+	(void)goUserID;
+}
+
+PLUGIN_API void SendPacket(const char* middlewareUserID, uint64_t targetGoUserID, void* data, int numBytes, ENetworkChannels channel, EPacketReliability reliability)
+{
+	(void)middlewareUserID;
+	(void)targetGoUserID;
+	(void)data;
+	(void)numBytes;
+	(void)channel;
+	(void)reliability;
+}
+
+PLUGIN_API int GetNextRecvPacketSize(uint8_t channelToReceiveOn)
+{
+	(void)channelToReceiveOn;
+	return 0;
+}
+
+PLUGIN_API bool RecvPacket(uint8_t** outData, uint8_t channelToReceiveOn)
+{
+	(void)channelToReceiveOn;
+
+	if (outData != nullptr)
+	{
+		*outData = nullptr;
+	}
+
+	return false;
+}
+
+PLUGIN_API void FreePacket(void* packetData)
+{
+	// Nothing is ever handed out by RecvPacket(), so there is nothing to release.
+	(void)packetData;
+}
+
+PLUGIN_API int GetConnectionLatencyForUser(const char* middlewareUserID, uint32_t goUserID)
+{
+	// No plugin-owned connections, the game measures latency on its own transport.
+	(void)middlewareUserID;
+	(void)goUserID;
+	return 0;
+}
+
+PLUGIN_API void DisconnectPlayer(const char* middlewareUserID, uint64_t goUserID)
+{
+	(void)middlewareUserID;
+	(void)goUserID;
+}
+
+PLUGIN_API void DisconnectAll()
+{
 }
 
 void HookupEvents()
@@ -481,7 +671,7 @@ void HookupEvents()
 		return;
 	}
 
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
 	if (acHandle == nullptr)
 	{
 		PluginLog("[EAC] AC HANDLE NULL - Cannot hook events");
@@ -533,7 +723,7 @@ void HookupEvents()
 			
 			if (callback != nullptr)
 			{
-				callback(Data->ViolationMessage, (int)Data->ViolationType);
+				callback(violationMsg, (int)Data->ViolationType);
 			}
 		});
 
@@ -547,37 +737,39 @@ void HookupEvents()
 			}
 
 			uint32_t targetUserID = (uint32_t)Data->ClientHandle;
-			EOS_HPlatform platformHandle = nullptr;
 			EOS_HAntiCheatClient acHandle = nullptr;
 			SendMessageViaTransportFunc sendMessageCallback = nullptr;
+			uint32_t localUserID = 0;
 			
 			{
 				std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-				
-				if (g_EOSPlatformHandle == nullptr)
-				{
-					return;
-				}
 
-				platformHandle = g_EOSPlatformHandle;
-				acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+				acHandle = GetAntiCheatHandle();
 				
 				if (acHandle == nullptr)
 				{
 					return;
 				}
 
-				if (Data->ClientHandle == nullptr || Data->MessageData == nullptr)
+				// NOTE: A null ClientHandle is EOS_ANTICHEATCLIENT_PEER_SELF, which
+				// is a valid destination - only the payload may not be null.
+				if (Data->MessageData == nullptr || Data->MessageDataSizeBytes == 0)
 				{
 					return;
 				}
 
 				sendMessageCallback = g_fnSendMessageViaTransport;
+				localUserID = g_goUserID;
 			}
 			// Lock released before processing
 			
-			// was it ourselves? just process immediately
-			if (targetUserID == g_goUserID)
+			// was it ourselves? just process immediately.
+			// localUserID is only meaningful once the local player has been
+			// registered; until then 0 means "unknown", not "peer 0".
+			const bool bIsSelf = (Data->ClientHandle == EOS_ANTICHEATCLIENT_PEER_SELF)
+				|| (localUserID != 0 && targetUserID == localUserID);
+
+			if (bIsSelf)
 			{
 				EOS_AntiCheatClient_ReceiveMessageFromPeerOptions receiveOpts = {};
 				receiveOpts.ApiVersion = EOS_ANTICHEATCLIENT_RECEIVEMESSAGEFROMPEER_API_LATEST;
@@ -592,7 +784,7 @@ void HookupEvents()
 				}
 				else
 				{
-					PluginLog("[EAC][LOCAL] AC SEND MESSAGE TO PEER: %u bytes (User %u)", Data->MessageDataSizeBytes, (uint32_t)Data->ClientHandle);
+					PluginLog("[EAC][LOCAL] AC SEND MESSAGE TO PEER: %u bytes (User %u)", Data->MessageDataSizeBytes, targetUserID);
 				}
 			}
 			else // send via transport
@@ -632,19 +824,12 @@ void HookupEvents()
 			}
 
 			const char* reasonStr = Data->ActionReasonDetailsString ? Data->ActionReasonDetailsString : "(null)";
-			PluginLog("[EAC] AC PEER ACTION REQIRED: %s (%d - %d)", reasonStr, Data->ClientAction, Data->ActionReasonCode);
+			PluginLog("[EAC] AC PEER ACTION REQUIRED: %s (%d - %d)", reasonStr, Data->ClientAction, Data->ActionReasonCode);
 
-			EOS_HPlatform platformHandle = nullptr;
 			ACPlayerActionRequiredCallbackFunc callback = nullptr;
 			
 			{
 				std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-				if (g_EOSPlatformHandle == nullptr)
-				{
-					return;
-				}
-
-				platformHandle = g_EOSPlatformHandle;
 				callback = g_fnAnticheatActionCallback;
 			}
 			// Lock released before calling callback
@@ -654,13 +839,13 @@ void HookupEvents()
 				uint32_t userID = (uint32_t)Data->ClientHandle;
 				if (Data->ClientHandle == EOS_ANTICHEATCLIENT_PEER_SELF)
 				{
-					PluginLog("[EAC] AC PEER ACTION REQIRED: is self (%u)", userID);
+					PluginLog("[EAC] AC PEER ACTION REQUIRED: is self (%u)", userID);
 				}
 				else
 				{
-					PluginLog("[EAC] AC PEER ACTION REQIRED: is remote (%u)", userID);
+					PluginLog("[EAC] AC PEER ACTION REQUIRED: is remote (%u)", userID);
 				}
-				callback(userID, Data->ActionReasonDetailsString, (int)(EAnticheatActionType)Data->ClientAction, (int)(EAnticheatActionReason)Data->ActionReasonCode);
+				callback(userID, reasonStr, (int)(EAnticheatActionType)Data->ClientAction, (int)(EAnticheatActionReason)Data->ActionReasonCode);
 			}
 		});
 }
@@ -669,7 +854,7 @@ void BeginSession()
 {
 	PluginLog("[EAC] BEGIN SESSION");
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
 
 	if (acHandle == nullptr)
 	{
@@ -703,7 +888,7 @@ bool DeregisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 	}
 
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
 
 	if (acHandle == nullptr)
 	{
@@ -716,7 +901,7 @@ bool DeregisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 	opts.PeerHandle = (void*)goUserID;
 	EOS_EResult res = EOS_AntiCheatClient_UnregisterPeer(acHandle, &opts);
 
-	PluginLog("[EAC] RegisterPlayer: Deregistering remote player %s - %d!", szMiddlewareUserID, goUserID);
+	PluginLog("[EAC] DeregisterPlayer: Deregistering remote player %s - %u!", szMiddlewareUserID, goUserID);
 
 	if (res != EOS_EResult::EOS_Success)
 	{
@@ -736,7 +921,7 @@ bool RegisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 	}
 
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
 
 	if (acHandle == nullptr)
 	{
@@ -744,8 +929,20 @@ bool RegisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 		return false;
 	}
 
-	if (EOS_ProductUserId_FromString(szMiddlewareUserID) == g_EOSUserID)
+	EOS_ProductUserId peerUserId = EOS_ProductUserId_FromString(szMiddlewareUserID);
+
+	if (peerUserId == nullptr)
 	{
+		PluginLog("[EAC] RegisterPlayer ERROR: Malformed middleware user ID '%s'", szMiddlewareUserID);
+		return false;
+	}
+
+	// NOTE: both sides must be non-null before comparing - otherwise an
+	// unparseable ID would compare equal to a not-yet-logged-in local user and
+	// the peer would silently never be registered.
+	if (g_EOSUserID != nullptr && peerUserId == g_EOSUserID)
+	{
+		PluginLog("[EAC] RegisterPlayer: Registering local player %s - %u!", szMiddlewareUserID, goUserID);
 		g_goUserID = goUserID;
 		return true;
 	}
@@ -758,18 +955,10 @@ bool RegisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 	opts.AuthenticationTimeout = EOS_ANTICHEATCLIENT_REGISTERPEER_MAX_AUTHENTICATIONTIMEOUT;
 	opts.AccountId_DEPRECATED = nullptr;
 	opts.IpAddress = nullptr;
-	opts.PeerProductUserId = EOS_ProductUserId_FromString(szMiddlewareUserID);
+	opts.PeerProductUserId = peerUserId;
 	EOS_EResult res = EOS_AntiCheatClient_RegisterPeer(acHandle, &opts);
 
-	if (opts.PeerProductUserId == g_EOSUserID)
-	{
-		PluginLog("[EAC] RegisterPlayer: Registering local player %s - %d!", szMiddlewareUserID, goUserID);
-		g_goUserID = goUserID;
-	}
-	else
-	{
-		PluginLog("[EAC] RegisterPlayer: Registering remote player %s - %d!", szMiddlewareUserID, goUserID);
-	}
+	PluginLog("[EAC] RegisterPlayer: Registering remote player %s - %u!", szMiddlewareUserID, goUserID);
 	
 	if (res != EOS_EResult::EOS_Success)
 	{
@@ -783,7 +972,7 @@ bool RegisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 void EndSession()
 {
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	EOS_HAntiCheatClient acHandle = EOS_Platform_GetAntiCheatClientInterface(g_EOSPlatformHandle);
+	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
 
 	if (acHandle == nullptr)
 	{
@@ -868,25 +1057,38 @@ void RefreshToken(const char* szGameToken, LoginCallback cb)
 	{
 		std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 		
-		if (g_EOSPlatformHandle == nullptr)
+		if (g_EOSPlatformHandle != nullptr)
 		{
-			PluginLog("[EAC] MIDDLEWARE ERROR: Platform not initialized!");
-			if (cb != nullptr)
-			{
-				cb(false);
-			}
-			return;
+			platformHandle = g_EOSPlatformHandle;
 		}
-		
-		platformHandle = g_EOSPlatformHandle;
+		else
+		{
+			g_LoginCallback = nullptr;
+		}
 	}
-	// Lock released before async operation
+	// Lock released before invoking host callbacks or entering the SDK
+
+	if (platformHandle == nullptr)
+	{
+		PluginLog("[EAC] MIDDLEWARE ERROR: Platform not initialized!");
+		if (cb != nullptr)
+		{
+			cb(false);
+		}
+		return;
+	}
 
 	EOS_HConnect ConnectHandle = EOS_Platform_GetConnectInterface(platformHandle);
 	
 	if (ConnectHandle == nullptr)
 	{
 		PluginLog("[EAC] MIDDLEWARE ERROR: Connect handle is null!");
+
+		{
+			std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+			g_LoginCallback = nullptr;
+		}
+
 		if (cb != nullptr)
 		{
 			cb(false);
@@ -914,6 +1116,8 @@ void RefreshToken(const char* szGameToken, LoginCallback cb)
 		{
 			if (Data == nullptr)
 			{
+				// Release the pending callback so a later refresh is not blocked.
+				FireLoginCallback(false);
 				return;
 			}
 
@@ -933,44 +1137,19 @@ void RefreshToken(const char* szGameToken, LoginCallback cb)
 
 				// NOTE: dont need to hook up events again
 
-				LoginCallback localCallback = nullptr;
-				{
-					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-					localCallback = g_LoginCallback;
-					g_LoginCallback = nullptr;
-				}
-				// Lock released before calling callback
-				
-				if (localCallback != nullptr)
-				{
-					localCallback(Data->ResultCode == EOS_EResult::EOS_Success);
-				}
+				FireLoginCallback(true);
 			}
 			else
 			{
-				PluginLog("[EAC] Token Refresh Failed: %p", Data);
-				
-				LoginCallback localCallback = nullptr;
-				{
-					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-					localCallback = g_LoginCallback;
-					g_LoginCallback = nullptr;
-				}
-				// Lock released before calling callback
-				
-				if (localCallback != nullptr)
-				{
-					localCallback(Data->ResultCode == EOS_EResult::EOS_Success);
-				}
+				PluginLog("[EAC] Token Refresh Failed: %s", EOS_EResult_ToString(Data->ResultCode));
+
+				FireLoginCallback(false);
 			}
 		});
 }
 
 void Login(const char* szGameToken, LoginCallback cb)
 {
-	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	g_LoginCallback = cb;
-
 	// Validate token pointer before logging to prevent format string vulnerabilities
 	if (szGameToken != nullptr)
 	{
@@ -981,9 +1160,24 @@ void Login(const char* szGameToken, LoginCallback cb)
 		PluginLog("[EAC] Connect EOS: (null token)");
 	}
 
-	PluginLog("[EAC] A");
-	PluginLog("[EAC] B");
-	if (g_EOSPlatformHandle == nullptr)
+	EOS_HPlatform platformHandle = nullptr;
+
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+		g_LoginCallback = cb;
+
+		if (g_EOSPlatformHandle == nullptr)
+		{
+			g_LoginCallback = nullptr;
+		}
+		else
+		{
+			platformHandle = g_EOSPlatformHandle;
+		}
+	}
+	// Lock released before invoking host callbacks or entering the SDK
+
+	if (platformHandle == nullptr)
 	{
 		PluginLog("[EAC] MIDDLEWARE ERROR: Platform not initialized!");
 		if (cb != nullptr)
@@ -992,12 +1186,18 @@ void Login(const char* szGameToken, LoginCallback cb)
 		}
 		return;
 	}
-	PluginLog("[EAC] C");
-	EOS_HConnect ConnectHandle = EOS_Platform_GetConnectInterface(g_EOSPlatformHandle);
+
+	EOS_HConnect ConnectHandle = EOS_Platform_GetConnectInterface(platformHandle);
 	
 	if (ConnectHandle == nullptr)
 	{
 		PluginLog("[EAC] MIDDLEWARE ERROR: Connect handle is null!");
+
+		{
+			std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+			g_LoginCallback = nullptr;
+		}
+
 		if (cb != nullptr)
 		{
 			cb(false);
@@ -1019,29 +1219,27 @@ void Login(const char* szGameToken, LoginCallback cb)
 	userLoginInfo.DisplayName = nullptr; // not set for oauth, retrieved from token instead
 	userLoginInfo.NsaIdToken = nullptr;
 	Options.UserLoginInfo = &userLoginInfo;
-	PluginLog("[EAC] D");
+
 	// TODO: Start a timeout
 	EOS_Connect_Login(ConnectHandle, &Options, nullptr, [](const EOS_Connect_LoginCallbackInfo* Data)
 		{
-			PluginLog("[EAC] done");
 			if (Data == nullptr)
 			{
+				// The SDK gave us nothing to act on; release the pending callback
+				// so a later login attempt is not blocked by stale state.
+				FireLoginCallback(false);
 				return;
 			}
-
-			PluginLog("[EAC] done2");
 
 			// TODO: Clear timeout
 
 			if (Data->ResultCode == EOS_EResult::EOS_Success)
 			{
-				PluginLog("[EAC] done 2a");
 				{
 					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 					g_EOSUserID = Data->LocalUserId;
 				}
 
-				PluginLog("[EAC] done 3");
 				char szBuffer[EOS_PRODUCTUSERID_MAX_LENGTH + 1] = { 0 };
 				int32_t outLen = sizeof(szBuffer);
 				EOS_ProductUserId_ToString(Data->LocalUserId, szBuffer, &outLen);
@@ -1050,56 +1248,38 @@ void Login(const char* szGameToken, LoginCallback cb)
 
 				HookupEvents();
 
-				LoginCallback localCallback = nullptr;
-				{
-					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-					localCallback = g_LoginCallback;
-					g_LoginCallback = nullptr;
-				}
-				// Lock released before calling callback
-			
-				if (localCallback != nullptr)
-				{
-					localCallback(Data->ResultCode == EOS_EResult::EOS_Success);
-				}
+				FireLoginCallback(true);
 			}
 			else if (Data->ResultCode == EOS_EResult::EOS_InvalidUser)
 			{
-				PluginLog("[EAC] done 4");
-			
 				EOS_HConnect ConnectHandle = nullptr;
-				EOS_ContinuanceToken ContinuanceToken = nullptr;
-			
+				EOS_ContinuanceToken ContinuanceToken = Data->ContinuanceToken;
+
+				if (ContinuanceToken == nullptr)
+				{
+					// Without a continuance token there is nothing to create the
+					// user from - calling CreateUser would just fail internally.
+					PluginLog("[EAC] ERROR: Login returned InvalidUser without a continuance token!");
+					FireLoginCallback(false);
+					return;
+				}
+
 				{
 					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-			
-					if (g_EOSPlatformHandle == nullptr)
-					{
-						PluginLog("[EAC] ERROR: Platform handle is null in login callback!");
-						if (g_LoginCallback != nullptr)
-						{
-							g_LoginCallback(false);
-						}
-						return;
-					}
 
-					ConnectHandle = EOS_Platform_GetConnectInterface(g_EOSPlatformHandle);
-					if (ConnectHandle == nullptr)
+					if (g_EOSPlatformHandle != nullptr)
 					{
-						PluginLog("[EAC] ERROR: Connect handle is null!");
-						if (g_LoginCallback != nullptr)
-						{
-							g_LoginCallback(false);
-						}
-						return;
-					}
-				
-					if (Data->ContinuanceToken != NULL)
-					{
-						ContinuanceToken = Data->ContinuanceToken;
+						ConnectHandle = EOS_Platform_GetConnectInterface(g_EOSPlatformHandle);
 					}
 				}
 				// Lock released here before async operation
+
+				if (ConnectHandle == nullptr)
+				{
+					PluginLog("[EAC] ERROR: Connect handle is null in login callback!");
+					FireLoginCallback(false);
+					return;
+				}
 
 				EOS_Connect_CreateUserOptions Options = {};
 				Options.ApiVersion = EOS_CONNECT_CREATEUSER_API_LATEST;
@@ -1111,6 +1291,7 @@ void Login(const char* szGameToken, LoginCallback cb)
 					{
 						if (Data == nullptr)
 						{
+							FireLoginCallback(false);
 							return;
 						}
 
@@ -1129,39 +1310,20 @@ void Login(const char* szGameToken, LoginCallback cb)
 
 							HookupEvents();
 						}
+						else
+						{
+							PluginLog("[EAC] Account Link Failed: %s", EOS_EResult_ToString(Data->ResultCode));
+						}
 
-						LoginCallback localCallback = nullptr;
-						{
-							std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-							localCallback = g_LoginCallback;
-							g_LoginCallback = nullptr;
-						}
-						// Lock released before calling callback
-					
-						if (localCallback != nullptr)
-						{
-							localCallback(Data->ResultCode == EOS_EResult::EOS_Success);
-						}
+						FireLoginCallback(Data->ResultCode == EOS_EResult::EOS_Success);
 					}
 				);
 			}
 			else
 			{
-				PluginLog("[EAC] done 5");
-				PluginLog("[EAC] Account Link Failed");
-			
-				LoginCallback localCallback = nullptr;
-				{
-					std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-					localCallback = g_LoginCallback;
-					g_LoginCallback = nullptr;
-				}
-				// Lock released before calling callback
-			
-				if (localCallback != nullptr)
-				{
-					localCallback(Data->ResultCode == EOS_EResult::EOS_Success);
-				}
+				PluginLog("[EAC] Login Failed: %s", EOS_EResult_ToString(Data->ResultCode));
+
+				FireLoginCallback(false);
 			}
 		});
 }
