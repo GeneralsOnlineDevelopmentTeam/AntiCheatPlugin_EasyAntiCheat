@@ -790,6 +790,10 @@ EOS_NotificationId g_ConnectionClosedNotificationId = EOS_INVALID_NOTIFICATIONID
 
 EOS_P2P_SocketId g_SocketId = {};
 
+// Registers the P2P connection notifications, which is what binds us to the
+// socket. Self-guarding and safe to call repeatedly; defined further down.
+static void HookupP2PNotifications();
+
 // Removes every P2P notification we registered. Safe to call with a null handle
 // or with nothing registered. Must be called with g_StateMutex held, and always
 // before the platform that owns the notifications is released.
@@ -1269,6 +1273,11 @@ PLUGIN_API void StartSignalling(const char* middlewareUserID, uint64_t goUserID)
 	// disconnect. Connections left over from a previous session are purged once
 	// per session in BeginSession()/EndSession() instead.
 
+	// The socket is destroyed by EndSession(); make sure it is back before we
+	// signal, otherwise the peer's connection request would arrive with nothing
+	// listening and EOS would never re-deliver it.
+	HookupP2PNotifications();
+
 	// Set the options for sending the message.
 	EOS_P2P_SendPacketOptions SendPacketOptions = {};
 	SendPacketOptions.ApiVersion = EOS_P2P_SENDPACKET_API_LATEST;
@@ -1352,7 +1361,7 @@ PLUGIN_API void SendPacket(const char* middlewareUserID, uint64_t targetGoUserID
 
 	// Set a boolean to specify whether to delay sending the message if the remote player is not currently connected.
 	// If you set this to false and a connection is not established with the peer, this data will be dropped.
-	SendPacketOptions.bAllowDelayedDelivery = EOS_TRUE;
+	SendPacketOptions.bAllowDelayedDelivery = (channel != ENetworkChannels::Ping && channel != ENetworkChannels::Pong);
 
 	// Send on the channel the game asked for. The game polls each channel
 	// separately in RecvPacket(), so forcing everything onto one channel here
@@ -1610,6 +1619,34 @@ PLUGIN_API void DisconnectAll()
 	if (result != EOS_EResult::EOS_Success)
 	{
 		PluginLog("[EAC] DisconnectAll: failed to close connections: %s", EOS_EResult_ToString(result));
+	}
+}
+
+// Drops every packet still queued on our socket in either direction. Called when
+// the session ends so that traffic from the lobby we just left can never be
+// delivered into the next one.
+void ClearP2PPacketQueue()
+{
+	EOS_HP2P P2PHandle = nullptr;
+	EOS_ProductUserId localUser = nullptr;
+
+	if (!AcquireP2PContext("ClearP2PPacketQueue", P2PHandle, localUser))
+	{
+		return;
+	}
+
+	EOS_P2P_ClearPacketQueueOptions opts = {};
+	opts.ApiVersion = EOS_P2P_CLEARPACKETQUEUE_API_LATEST;
+	opts.LocalUserId = localUser;
+	// Null remote user means "every peer".
+	opts.RemoteUserId = nullptr;
+	opts.SocketId = &g_SocketId;
+
+	EOS_EResult result = EOS_P2P_ClearPacketQueue(P2PHandle, &opts);
+
+	if (result != EOS_EResult::EOS_Success)
+	{
+		PluginLog("[EAC] ClearP2PPacketQueue: failed: %s", EOS_EResult_ToString(result));
 	}
 }
 
@@ -2021,14 +2058,16 @@ static void ProcessIncomingACMessages()
 void HookupEvents()
 {
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
-	
+
+	// Always done first and independently of g_bEventsHooked: the socket is torn
+	// down in EndSession(), so it has to be recreated here even when the
+	// anti-cheat notifications below are already registered.
+	HookupP2PNotifications();
+
 	if (g_bEventsHooked)
 	{
 		return;
 	}
-
-	EOS_HP2P P2PHandle = GetP2PHandle();
-
 
 	// Clean up any existing notification IDs before registering new ones (prevents memory leak on re-hook)
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
@@ -2224,8 +2263,22 @@ void HookupEvents()
 				}
 			});
 	}
-	
+}
 
+static void HookupP2PNotifications()
+{
+	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
+
+	// The socket only exists for as long as something references it, so the
+	// notifications are registered per session and torn down by EndSession().
+	// Re-registering recreates the socket binding against the current local
+	// user, which is what makes a second lobby (or an exit/rejoin) work.
+	if (g_bP2PEventsHooked)
+	{
+		return;
+	}
+
+	EOS_HP2P P2PHandle = GetP2PHandle();
 
 	// hook up notifications for networking
 	if (P2PHandle == nullptr)
@@ -2234,16 +2287,18 @@ void HookupEvents()
 		return;
 	}
 
-	// These survive across sessions, so only register them once. Re-registering
-	// per session would leave a window between EndSession() and BeginSession()
-	// where an incoming connection request is silently dropped - EOS never
-	// re-delivers it, so the peer would wait for a signalling retry.
-	if (g_bP2PEventsHooked)
+	if (g_EOSUserID == nullptr)
 	{
+		// Without a local user the notifications would be registered against a
+		// null user and never fire. BeginSession()/the login path call us again
+		// once the user is known.
+		PluginLog("[EAC] P2P notifications deferred - no local user yet");
 		return;
 	}
 
 	g_bP2PEventsHooked = true;
+
+	PluginLog("[EAC] Creating P2P socket '%s'", g_SocketId.SocketName);
 
 	// Set the options for subscribing to connection request notifications.
 	EOS_P2P_AddNotifyPeerConnectionRequestOptions ConnectionRequestNotificationOptions = {};
@@ -2352,9 +2407,9 @@ void BeginSession()
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
 
 	// NOTE: deliberately no DisconnectAll() here. EndSession() already closed
-	// everything on the way out, and a peer that rejoined ahead of us may have
-	// already re-established its connection by now - tearing that down would
-	// force the game to wait for another signalling retry.
+	// every connection and destroyed the socket on the way out, so there is
+	// nothing left over to tear down - HookupEvents() below recreates the socket
+	// from scratch for this session.
 
 	HookupEvents();
 
@@ -2444,6 +2499,10 @@ bool RegisterPlayer(const char* szMiddlewareUserID, uint32_t goUserID)
 
 	std::lock_guard<std::recursive_mutex> lock(g_StateMutex);
 	EOS_HAntiCheatClient acHandle = GetAntiCheatHandle();
+
+	// The game can register peers before BeginSession() runs, and EndSession()
+	// destroyed the socket - make sure it exists before we accept anyone.
+	HookupP2PNotifications();
 
 	bool bHadPendingRequest = false;
 	{
@@ -2556,10 +2615,14 @@ void EndSession()
 
 	g_LastPingSendTime = std::chrono::steady_clock::time_point{};
 
-	// NOTE: the P2P connection notifications are deliberately left registered.
-	// They are scoped to the login, not the session: unhooking them here would
-	// make the plugin deaf to a peer that reconnects while we are between
-	// lobbies, and EOS never re-delivers a connection request.
+	// Tear the socket itself down. Closing the connections is not enough: the
+	// notification registrations keep the socket alive inside EOS, and a socket
+	// that survives into the next session wedges the rejoin - the connection
+	// notifications are edge-triggered, so no request/established event is ever
+	// raised for the new lobby. Dropping the registrations here destroys the
+	// socket; BeginSession() -> HookupEvents() recreates it.
+	ClearP2PPacketQueue();
+	RemoveP2PNotifications(GetP2PHandle());
 
 	// Remove all registered notification callbacks before ending the session
 	if (acHandle == nullptr)
